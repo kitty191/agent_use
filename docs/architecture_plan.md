@@ -22,7 +22,7 @@
 ### 1.2 首次自动全量探测、按需重扫与平台勾选（严格 Opt-in）
 - **监控软件本身免注册**，无需创建自有账号。
 - **首次打开自动全量轻量扫描（One-shot Discovery）**：
-  - 自动对注册表中的全部 Agent 执行一次只读存在性扫描（覆盖 **Codex、Claude Code、Antigravity**，以及后续扩展的 **Cursor、Gemini CLI、OpenCode、Aider 及国产大模型/编码 Agent 生态**如 Trae、Qwen Code、Kimi CLI、DeepSeek 生态工具等）。
+  - 自动对注册表中的全部 Agent 执行一次只读存在性扫描（覆盖 **Codex、Claude Code、Antigravity**，以及后续扩展的 **Cursor、Gemini CLI、OpenCode、Aider 及国产大模型/编码 Agent 生态**如 **DeepSeek 桌面端**、Trae、Qwen Code、Kimi CLI 等）。
   - 扫描仅检查默认目录、应用包与可执行文件存在性，**不读取对话正文、不发起联网请求、不触发任何限流**。
   - 架构上将 **「发现探测器（`AgentDetector`，声明式轻量规则）」** 与 **「数据采集适配器（`ProviderAdapter`）」** 解耦，逐项标明状态：
     - `已检测到`（发现客户端与本地数据目录）
