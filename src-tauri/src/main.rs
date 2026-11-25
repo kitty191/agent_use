@@ -35,17 +35,26 @@ fn save_selection(app: State<App>, ids: Vec<String>) -> Result<Settings, String>
 fn last_quota(app: State<App>) -> Result<Option<quota::Quota>, String> {
     app.db.cached_quota().map_err(|e| e.to_string())
 }
+struct QueryGuard<'a>(&'a std::sync::atomic::AtomicBool);
+impl Drop for QueryGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[tauri::command]
 async fn refresh_quota(app: State<'_, App>) -> Result<quota::Quota, String> {
     use std::sync::atomic::Ordering;
     let codex = app.db.enabled_agent("codex").map_err(|e| e.to_string())?;
-    let binary = codex.binary.ok_or("未找到 Codex CLI，安装后请重新扫描")?;
+    let binary = codex.binary.ok_or("未找到 Codex CLI，安装后请点击「重新扫描」")?;
+    if !binary.is_file() {
+        return Err("已记录的 Codex CLI 路径不可用，请点击「重新扫描」重新定位".into());
+    }
     if app.querying.swap(true, Ordering::AcqRel) {
         return Err("正在查询 Codex".into());
     }
-    let result = quota::query(&binary).await;
-    app.querying.store(false, Ordering::Release);
-    let snapshot = result.map_err(|e| e.to_string())?;
+    let _guard = QueryGuard(&app.querying);
+    let snapshot = quota::query(&binary).await.map_err(|e| e.to_string())?;
     app.db.save_quota(&snapshot).map_err(|e| e.to_string())?;
     Ok(snapshot)
 }
@@ -72,7 +81,10 @@ async fn local_usage(app: State<'_, App>, id: String) -> Result<usage::Usage, St
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let path = app.path().app_local_data_dir()?;
+            let path = std::env::var_os("AGENT_USE_DATA_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or(app.path().app_local_data_dir()?);
             std::fs::create_dir_all(&path)?;
             let db = Store::open(&path.join("monitor.sqlite"))?;
             app.manage(App {

@@ -125,6 +125,11 @@ pub fn scan(home: &Path) -> Vec<Agent> {
         home.join(".local/bin"),
         home.join(".bun/bin"),
         home.join(".volta/bin"),
+        home.join(".npm-global/bin"),
+        home.join(".cargo/bin"),
+        home.join(".asdf/shims"),
+        home.join(".local/share/mise/shims"),
+        home.join(".mise/shims"),
         "/opt/homebrew/bin".into(),
         "/usr/local/bin".into(),
     ]);
@@ -146,6 +151,8 @@ pub fn scan(home: &Path) -> Vec<Agent> {
     bins.extend([
         "/Applications/Codex.app/Contents/Resources".into(),
         home.join("Applications/Codex.app/Contents/Resources"),
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS".into(),
+        home.join("Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS"),
     ]);
     AGENTS
         .iter()

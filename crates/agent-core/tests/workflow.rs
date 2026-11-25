@@ -200,3 +200,146 @@ fn codex_live_rollout_in_new_date_directory_counts_each_response_once() -> anyho
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn quota_tolerates_null_error_and_distinguishes_failure_stages() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir()?;
+
+    // 1. CLI missing
+    let missing = dir.path().join("missing-codex");
+    let err = quota::query(&missing).await.unwrap_err().to_string();
+    assert!(err.contains("未找到可执行的 Codex CLI"), "got: {err}");
+
+    // 2. Tolerates non-JSON stdout lines and explicit `"error": null`
+    let ok_bin = dir.path().join("codex-ok");
+    fs::write(
+        &ok_bin,
+        r#"#!/usr/bin/env python3
+import json,sys
+print("startup diagnostic banner", flush=True)
+for line in sys.stdin:
+    msg=json.loads(line)
+    if msg['method']=='initialized': continue
+    if msg['method']=='initialize': result={}
+    elif msg['method']=='account/read':
+        result={'account':{'type':'chatgpt','email':'alice@example.org','planType':'plus'}}
+    elif msg['method']=='account/rateLimits/read':
+        result={'rateLimitsByLimitId':{'codex':{'primary':{'windowDurationMins':10080,'usedPercent':20,'resetsAt':1795935437},'secondary':None}}}
+    print(json.dumps({'id':msg['id'],'error':None,'result':result}),flush=True)
+"#,
+    )?;
+    fs::set_permissions(&ok_bin, fs::Permissions::from_mode(0o700))?;
+    let q = quota::query(&ok_bin).await?;
+    assert_eq!(q.account, "a***@example.org");
+    assert_eq!(q.windows.len(), 1);
+
+    // 3. Not logged in
+    let unauth_bin = dir.path().join("codex-unauth");
+    fs::write(
+        &unauth_bin,
+        r#"#!/usr/bin/env python3
+import json,sys
+for line in sys.stdin:
+    msg=json.loads(line)
+    if msg['method']=='initialized': continue
+    result={} if msg['method']=='initialize' else {'account':None}
+    print(json.dumps({'id':msg['id'],'result':result}),flush=True)
+"#,
+    )?;
+    fs::set_permissions(&unauth_bin, fs::Permissions::from_mode(0o700))?;
+    let err = quota::query(&unauth_bin).await.unwrap_err().to_string();
+    assert!(err.contains("尚未登录"), "got: {err}");
+
+    // 4. Network error during rateLimits/read
+    let net_bin = dir.path().join("codex-net");
+    fs::write(
+        &net_bin,
+        r#"#!/usr/bin/env python3
+import json,sys
+for line in sys.stdin:
+    msg=json.loads(line)
+    if msg['method']=='initialized': continue
+    if msg['method']=='initialize':
+        print(json.dumps({'id':msg['id'],'result':{}}),flush=True)
+    elif msg['method']=='account/read':
+        print(json.dumps({'id':msg['id'],'result':{'account':{'type':'chatgpt','email':'a@b.com','planType':'plus'}}}),flush=True)
+    elif msg['method']=='account/rateLimits/read':
+        print(json.dumps({'id':msg['id'],'error':{'code':-32000,'message':'dns lookup failed'}}),flush=True)
+"#,
+    )?;
+    fs::set_permissions(&net_bin, fs::Permissions::from_mode(0o700))?;
+    let err = quota::query(&net_bin).await.unwrap_err().to_string();
+    assert!(err.contains("网络查询失败"), "got: {err}");
+
+    // 5. Rate limit (429)
+    let rl_bin = dir.path().join("codex-429");
+    fs::write(
+        &rl_bin,
+        r#"#!/usr/bin/env python3
+import json,sys
+for line in sys.stdin:
+    msg=json.loads(line)
+    if msg['method']=='initialized': continue
+    if msg['method']=='initialize':
+        print(json.dumps({'id':msg['id'],'result':{}}),flush=True)
+    elif msg['method']=='account/read':
+        print(json.dumps({'id':msg['id'],'result':{'account':{'type':'chatgpt','email':'a@b.com','planType':'plus'}}}),flush=True)
+    elif msg['method']=='account/rateLimits/read':
+        print(json.dumps({'id':msg['id'],'error':{'code':429,'message':'HTTP 429 Too Many Requests'}}),flush=True)
+"#,
+    )?;
+    fs::set_permissions(&rl_bin, fs::Permissions::from_mode(0o700))?;
+    let err = quota::query(&rl_bin).await.unwrap_err().to_string();
+    assert!(err.contains("限流"), "got: {err}");
+
+    // 6. Method not supported (e.g., older Codex CLI) must not blame network
+    let unsupported_bin = dir.path().join("codex-unsupported");
+    fs::write(
+        &unsupported_bin,
+        r#"#!/usr/bin/env python3
+import json,sys
+for line in sys.stdin:
+    msg=json.loads(line)
+    if msg['method']=='initialized': continue
+    if msg['method']=='initialize':
+        print(json.dumps({'id':msg['id'],'result':{}}),flush=True)
+    elif msg['method']=='account/read':
+        print(json.dumps({'id':msg['id'],'result':{'account':{'type':'chatgpt','email':'a@b.com','planType':'plus'}}}),flush=True)
+    elif msg['method']=='account/rateLimits/read':
+        print(json.dumps({'id':msg['id'],'error':{'code':-32601,'message':'Method not found'}}),flush=True)
+"#,
+    )?;
+    fs::set_permissions(&unsupported_bin, fs::Permissions::from_mode(0o700))?;
+    let err = quota::query(&unsupported_bin)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("不支持"), "got: {err}");
+    assert!(!err.contains("网络"), "got: {err}");
+
+    // 7. Unknown RPC error on rateLimits/read must not blame network either
+    let unknown_bin = dir.path().join("codex-unknown");
+    fs::write(
+        &unknown_bin,
+        r#"#!/usr/bin/env python3
+import json,sys
+for line in sys.stdin:
+    msg=json.loads(line)
+    if msg['method']=='initialized': continue
+    if msg['method']=='initialize':
+        print(json.dumps({'id':msg['id'],'result':{}}),flush=True)
+    elif msg['method']=='account/read':
+        print(json.dumps({'id':msg['id'],'result':{'account':{'type':'chatgpt','email':'a@b.com','planType':'plus'}}}),flush=True)
+    elif msg['method']=='account/rateLimits/read':
+        print(json.dumps({'id':msg['id'],'error':{'code':-32099,'message':'unexpected internal state'}}),flush=True)
+"#,
+    )?;
+    fs::set_permissions(&unknown_bin, fs::Permissions::from_mode(0o700))?;
+    let err = quota::query(&unknown_bin).await.unwrap_err().to_string();
+    assert!(err.contains("未知错误"), "got: {err}");
+    assert!(!err.contains("网络"), "got: {err}");
+
+    Ok(())
+}

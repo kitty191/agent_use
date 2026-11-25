@@ -40,7 +40,9 @@ const capability = (id: string) =>
     ? "本机 Token · 联网查询账号额度"
     : id === "claude"
       ? "本机 Token · 离线读取"
-      : "安装状态 · 用量来源待验证";
+      : id === "antigravity"
+        ? "安装状态 · 账号/额度/重置/官方 Token 暂不可查"
+        : "安装状态 · 用量来源待验证";
 function duration(minutes: number | null) {
   if (!minutes) return "额度窗口";
   if (minutes % 1440 === 0) return minutes / 1440 + " 天额度";
@@ -249,6 +251,11 @@ function UsagePanel({ agent }: { agent: Agent }) {
                   : "读取本地记录中…")}
           </footer>
         </>
+      ) : agent.id === "antigravity" ? (
+        <p className="muted">
+          当前版本仅展示上方发现状态；账号归属、模型/额度池、剩余额度、重置时间与官方
+          Token 明细暂不可查（桌面端无受支持的只读查询接口）。
+        </p>
       ) : (
         <p className="muted">用量与额度来源待验证</p>
       )}
