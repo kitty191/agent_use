@@ -1,0 +1,14 @@
+# Phase 0 local probe outputs (do not commit raw reports)
+phase0_report*.json
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+
+# Rust / Tauri / Node (reserved for Phase 1+)
+/target/
+/src-tauri/target/
+/node_modules/
+/dist/
+*.sqlite
+*.db
