@@ -38,9 +38,12 @@
    - **测试 B — 终端 `open` 启动正式包（复用已有数据库，注意环境边界）**：
      - 条件：在无 `tauri dev` / Vite 进程状态下执行 `open "target/release/bundle/macos/Agent Use.app"`；因 macOS 的 `open` 可能继承调用终端环境，该项仅验证正式包本身可恢复已有配置/历史、调用 `codex app-server` 完成无模型请求额度查询，以及退出重开后已统计响应无重复计入，**不单独等同于从访达双击后的极简 `PATH` 额度查询验收**。
      - 当次观测快照（仅作当时记录，后续实测以面板实时基线为准）：已有配置 `enabled = ["codex", "antigravity"]` 保留，启动后 `checked_at` 更新（`20:01:13` → `20:14:29` → 退出重开后 `20:14:37`），返回 `t***@outlook.com`、`PLUS`、7 天额度已用 `38%`（界面显示剩余 `62%`）、重置时间 `2026-11-29 14:57:17+08:00`；退出重开后已统计响应数与总数保持不变。
-   - **开发版实测 vs 正式包待用户从访达双击实测项**：
-     - 此前开发版（`verify:codex`）两次单响应终端测试的界面更新延迟上界为 `538 ms` 与 `484 ms`；正式包不加载验收探针，延迟记为「延迟未测」。
-     - 正式包尚待用户从访达实际双击完成最后三项真机验收：① 点「刷新额度」确认查询成功时间更新并与官方额度/重置时间对照；② 本机 Codex 发一条消息验证自动刷新并与该轮日志响应总和核对增量；③ `⌘Q` 退出后再发一条消息、重新双击打开验证补读且再次重开无重复。
+   - **测试 C — 访达双击启动正式包，2026-11-25，北京时间**
+     - 手动点「刷新额度」后，最近成功时间从 23:17:26 更新到 23:19:09。面板显示 7 天额度剩余 57%，11 月 29 日 14:57:17 重置。官方 Codex CLI 0.172.0 的 `/status` 同样显示周额度剩余 57%，11 月 29 日 14:57 重置，双方在官方显示精度内一致。
+     - 应用运行时，独立 CLI 会话的第一条响应用量为 18,700 Token。未手动刷新用量，日志与数据库中对应响应均为一条。23:20:54 的面板今日总数为 7,708,240，与截至该秒的数据库合计一致。
+     - 用 ⌘Q 退出并确认进程结束后，第二条响应写入日志，计 20,878 Token。此时它在数据库中为零条，今日累计仍为 7,708,240。从访达重开后该响应入库一次，23:22:07 的面板与数据库均为 9,335,079。
+     - 再次退出并从访达启动后，两条验收响应仍各一条，合计 39,578 Token。截至 23:22:07 的历史合计仍为 9,335,079。验收聊天同时产生了其他响应，因此采用响应 ID 和固定时间范围核对去重。
+     - 已验证正式包的可见数字自动更新，未测量日志落盘到界面绘制的精确延迟。此前开发版两次测得的延迟上界分别为 538 ms 和 484 ms。
 
 
 ---
@@ -76,9 +79,38 @@
 | **模型或额度池** | Desktop App `2.35.1` | `/docs/cli/commands/usage.md`、`/docs/plans.md`、`/docs/models.md` | — | **额度池暂不可查**。官方文档说明模型按组共享额度池（如 Gemini 组、第三方 Claude/GPT 组），但仅在 `agy` CLI 交互命令 `/usage`（`/quota`）或桌面端 Settings UI 查看，无公开非交互 CLI 参数或只读 API。（注：本地对话日志含单步 `model` 名，不含账户额度池映射。） |
 | **剩余额度** | Desktop App `2.35.1` | `/docs/cli/commands/usage.md`、`/docs/cli/credits.md`、`/docs/cli/reference.md` | — | **暂不可查**。消费级套餐无公开只读 REST/RPC 接口，也无 `agy --usage` 类非交互查询参数；仅 `agy` CLI 交互态 `/usage`、`/credits`、状态栏或桌面端 UI 人工可见（`agy` CLI `statusLine` 回调含 `quota.<bucket>.remaining_fraction`，但仅限 CLI 运行态被动推送）。 |
 | **重置时间** | Desktop App `2.35.1` | `/docs/plans.md`、`/docs/cli/commands/usage.md`、`/docs/cli/statusline.md` | — | **暂不可查**。官方文档仅说明 Pro/Ultra 按 5 小时滚动刷新至周上限、Free/Plus 为周限额；具体重置时间仅在官方 UI 人工可见（或 `agy` CLI `statusLine` 的 `quota.<bucket>.reset_time`）。 |
-| **Token 明细** | Desktop App `2.35.1` | 本机 `~/.gemini/antigravity/brain/<conv-id>/.system_generated/logs/transcript.jsonl` + `/docs/cli/statusline.md` | 无需额外授权（本地只读文件） | **发现本地候选日志，但本轮未接入主卡片**。实测本机 4 个对话的 `.system_generated/logs/transcript.jsonl` 共含 106 条 `type: "PLANNER_RESPONSE"`、`status: "DONE"` 记录（`step_index` 在各对话内无重复），字段包含 `created_at`、`model`、`input_tokens`、`cache_read_tokens`、`output_tokens`，且连续轮次上下文增长验证 `cache_read_tokens` **不含于** `input_tokens`；官方文档 `statusline.md` 亦引用该 `transcript_path`。但该文件位于 `.system_generated/` 内部目录、未作为公开稳定统计契约文档化，且 Desktop App UI 未提供可交叉核对的官方 Token 总量（亦未明确 `output_tokens` 是否含思考 Token 或覆盖全部客户端活动），因此本轮暂不接入主卡片，保留为后续核对候选。 |
+| **Token 明细（本机对话日志）** | Desktop App `2.35.1` | 本机 `~/.gemini/antigravity/brain/<conv-id>/.system_generated/logs/transcript.jsonl` + `/docs/cli/statusline.md` | 无需额外授权（本地只读文件） | **已核验口径并接入本机用量卡片**。实测 5 个对话共 158 条 `type: "PLANNER_RESPONSE"`、`status: "DONE"` 记录（仅此事件含 Token 字段），详见下方口径核验。 |
 
-- **本轮产品处理结论**：Antigravity 卡片继续展示本机安装发现状态（`已检测到`），明确写清「账号归属、模型/额度池、剩余额度、重置时间与官方 Token 明细暂不可查」；在确认受支持的只读授权能够获取额度数据前，不设计 Google 账号绑定。
+- **Antigravity 本机日志计数口径与去重核验（2026-11-25，Desktop App `2.35.1`）**：
+  1. **文件过滤规则（防 4 倍重复）**：`<brain>/<conv-id>/.system_generated/logs/` 下同时存在 `transcript.jsonl`、`transcript_full.jsonl`、`chunks/transcript/*.jsonl` 与 `chunks/transcript_full/*.jsonl`。采集器显式穿透隐藏目录 `.system_generated` 且仅匹配 `<brain>/<conv-id>/.system_generated/logs/transcript.jsonl`，忽略其余副本与分片。
+  2. **计数单位（步骤级增量）**：一条用户消息可产生多个 `PLANNER_RESPONSE` 步骤；`output_tokens` 在连续步骤间上下波动（如 `471 → 1470 → 115 → 1578 → 221 → 295`），`input_tokens + cache_read_tokens` 对应单次模型调用的上下文长度，证明每条 `PLANNER_RESPONSE` (`status = "DONE"`) 为**单个已完成模型步骤的增量**（非会话累计快照）。卡片标注为「最近一次模型步骤」。
+  3. **缓存口径与总量公式（已实测复核）**：
+     - 实测公式：**`step_total = input_tokens + cache_read_tokens + output_tokens`**。
+     - 脱敏数值证据（共 158 条记录中 **147 条**满足 `cache_read_tokens > input_tokens`，排除包含可能）：
+       - 对话 `31f4df9a`：`step=3`（`in=30,017, cache_read=0, out=1,470`）→ `step=5`（`in=3,701, cache_read=30,018, out=115`，`in+cache_read=33,719`，`total=33,834`）→ `step=11`（`in=2,553, cache_read=33,835, out=221`）；
+       - 对话 `b9c97261`：`step=1`（`in=14,688, cache_read=0, out=558, total=15,246`）→ `step=3`（`in=3,239, cache_read=12,631, out=394, in+cache_read=15,870`）→ `step=7`（`in=2,062, cache_read=15,247, out=341, in+cache_read=17,309`）→ `step=9`（`in=7,311, cache_read=17,310, out=182, in+cache_read=24,621`）；
+       - 对话 `ccc9c45b`（含 `model=null` 历史步与 Claude/Gemini 切换）：`step=4`（`in=2,053, cache_read=80,789, out=1,273`），`model` 可为空，因此解析不要求 `model` 非空。
+  4. **去重键、缺失缓存、亚秒精度与旧库升级**：
+     - 去重键为 `(provider="antigravity", session=<conversation_id>, response=<step_index>)`（实测 5 个对话 158 条记录内 `step_index` 0 重复）；
+     - 仅计入 `status == "DONE"` 的终态记录，忽略 `RUNNING` 等中间态与缺少换行符的半行；
+     - 区分 `cache_read_tokens: 0`（有效观测，正常计入完整总量）与字段缺失/`null`（保留已知分项并标为 `complete = 0`「用量不完整」，不计入完整今日总量；同一步骤补报完整值时原地升级且不翻倍，重放较早的不完整记录不覆盖已确认完整值）；
+     - `created_at` 保留亚秒纳秒精度（`at_ns`），「最近一次模型步骤」按 `COALESCE(at_ns, at * 1e9) DESC` 选取；时间戳完全相同时按稳定全序并列规则 `session DESC` → 数值步号/响应 ID 降序确定，保证跨导入顺序与重启一致；今日统计仍按本地时区归日；
+     - 旧库（`PRAGMA user_version < 2`）升级为 v2 时，事务内补齐列并仅将已有 `antigravity` 行标为 `legacy = 1`、仅重置 `antigravity` 游标回读一次（不碰 Codex / Claude 游标与历史）；仍在本机的日志自动补齐亚秒精度与缓存完整态（`legacy = 0`），已删除日志保留历史并如实标注旧版迁移状态。
+  5. **最小脱敏样例（仅保留解析所需字段，不含正文与思考内容）**：
+     ```json
+     {"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-25T11:51:12Z","model":"gemini-4-neon-high","input_tokens":14688,"cache_read_tokens":0,"output_tokens":558}
+     {"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-25T11:51:27Z","model":"gemini-4-neon-high","input_tokens":3239,"cache_read_tokens":12631,"output_tokens":394}
+     ```
+  6. **本机正式包（`Agent Use.app`）实测核对（2026-11-25）**：
+     - 独立 Python 汇总本机 5 份 `transcript.jsonl`（忽略 `transcript_full.jsonl` 与 `chunks/`）：共 `163` 条已完成步骤（累计 `18,238,329` Token），今日（本地日期 `2026-11-25`）`75` 条步骤合计 `10,851,132` Token（`input=538,510`、`cache_read=10,177,279`、`output=135,343`），最近步骤 `272,887` Token。
+     - 启动新版 `Agent Use.app` 后读取 `monitor.sqlite`（`provider = "antigravity"`）：全量 `163` 条 / `18,238,329` Token、今日 `75` 条 / `10,851,132` Token、最近步骤 `272,887` Token，游标仅记录 5 份 `transcript.jsonl`，与独立脚本 **100% 逐项一致**；退出并重开一次后总数完全不变（无重复计数）；同库中 Codex（`297` 条 / `48,071,996` Token）保持独立。
+     - **新建对话实时采集（11 月 25 日，正式包）**：对照前 5 份日志共 166 个完整步骤，逐条核对数据库无差异。面板今日基线为 11,681,602 Token。用户在 Antigravity 新建第 6 个对话后，23:37:33 完成了 1 个模型步骤，输入 14,658、缓存读取 0、输出 25，共 14,683 Token。未点击刷新，正式包面板显示今日 11,696,285、最近步骤 14,683。167 个步骤与数据库逐条一致。以上时间为北京时间。未测量日志落盘至界面绘制的精确延迟。
+     - **退出后补读与重启去重**：确认 Agent Use 已退出后，同一对话于 23:38:45 产生第 2 个完成步骤，输入 2,157、缓存读取 12,601、输出 22，共 14,780 Token。重开前日志有 168 个完整步骤，数据库仍为 167 条。重开后面板今日累计为 11,711,065，最近步骤为 14,780。再次退出重开，两项数字保持一致。最终 6 份日志的全部 168 个步骤与数据库按对话、步骤号、时间（秒）和 Token 总数逐条一致，今日共 80 步。
+  7. **仍待确认的范围与边界**：
+     - 账号归属、模型/额度池、剩余额度与重置时间仍暂不可查（不绑定 Google 账号，不要求安装 `agy` CLI）；
+     - 本机日志覆盖 Antigravity 桌面端对话及子代理在 `brain/<conv-id>/.system_generated/logs/transcript.jsonl` 中落盘的规划步骤，是否包含 IDE Tab 补全、`output_tokens` 是否含思考 Token 拆分以及与官方「Work Done」配额折算关系仍待官方进一步说明。
+
+- **本轮产品处理结论**：勾选 Antigravity 后卡片展示本机对话日志统计的「今日已记录 Token」「最近一次模型步骤」及时间，并明确注明数据来源与账号/额度/重置时间暂不可查；无日志目录时后端返回 `waiting` 状态、卡片显示「等待首次对话记录」且顶部不亮监听绿灯。
 
 ---
 
@@ -90,8 +122,8 @@
 | **Codex** (`0.154.0`) | 累计 Token | **指定版本已实测** | 来自 `event_msg:token_count.info.total_token_usage`，或按 `token_usage_record` 聚合 |
 | **Codex** (`0.154.0`) | 套餐（Plan） | **指定版本已实测** | 来自 `event_msg:token_count.rate_limits.plan_type`（样例值 `plus`） |
 | **Codex** (`0.154.0`) | 额度百分比 & 重置时间 | **指定版本已实测**（日志结构）；百分比 **已核对**，重置时间 **已核对至分钟** | 来自 `rate_limits.primary` / `secondary`，按 `window_minutes`（300 / 10080）动态分类，`resets_at` 为 Unix 秒级时间戳 |
-| **Codex** (`0.154.0` / `0.172.0`) | 当前账号 & 主动刷新 | **指定版本已实测** | app-server 的 `account/read` 与 `account/rateLimits/read` 在无模型请求时返回当前账号与额度；正式包已分别验证极简 `PATH` 下 CLI 发现与 `open` 启动查询，待访达双击最终确认 |
+| **Codex** (`0.154.0` / `0.172.0`) | 当前账号 & 主动刷新 | **指定版本已实测** | app-server 可在无模型请求时查询账号与额度。使用 0.172.0 从访达启动正式包并手动刷新，周额度百分比和分钟级重置时间均与官方 `/status` 一致。 |
 | **Claude Code** (`2.1.278`) | 本次请求 & 累计 Token | **指定版本已实测**（历史日志 + 单测） | 来自 `~/.claude/projects/**/*.jsonl` 的 `assistant` 记录，按 `(sessionId, message.id)` 去重；`cache_read`/`cache_creation` 不含于 `input_tokens`。本机未安装客户端，本轮跳过真机会话验收 |
 | **Claude Code** (`2.1.278`) | 账号 / 套餐 / 额度 / 重置 / 主动刷新 | **未测（未安装）** | 本机未安装 `claude` CLI / 客户端，本轮无需安装 |
 | **Antigravity** (`2.35.1`) | 账号 / 模型池 / 剩余额度 / 重置时间 | **已调查 · 暂不可查** | Desktop App `2.35.1` 无受支持的只读外部接口；`/usage` 仅限交互 UI，`statusLine` 仅限未安装的 `agy` CLI 运行态回调 |
-| **Antigravity** (`2.35.1`) | Token 明细 | **已调查 · 发现候选日志未接入** | 本机 `.system_generated/logs/transcript.jsonl` 含 `PLANNER_RESPONSE` token 字段（`cache_read_tokens` 不含于 `input_tokens`），但属内部生成日志且无桌面端官方总量可核对，本轮不接入主卡片 |
+| **Antigravity** (`2.35.1`) | Token 明细（本机对话日志） | **指定版本已实测并接入** | 来自 `~/.gemini/antigravity/brain/<conv-id>/.system_generated/logs/transcript.jsonl` 的 `PLANNER_RESPONSE`（`status = "DONE"`），去重键 `(conversation_id, step_index)`，公式 `input_tokens + cache_read_tokens + output_tokens`；已忽略 `transcript_full.jsonl` 与 `chunks/` |

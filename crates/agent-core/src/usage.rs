@@ -1,27 +1,59 @@
 use crate::store::Store;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    fs::File,
+    io::{BufRead, BufReader, ErrorKind, Seek, SeekFrom},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
-use std::{
-    fs::File,
-    io::{BufRead, BufReader, Seek, SeekFrom},
-    path::Path,
-};
 use walkdir::WalkDir;
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStatus {
+    Active,
+    Waiting,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct TokenParts {
+    pub input: Option<i64>,
+    pub cache_read: Option<i64>,
+    pub output: Option<i64>,
+}
+
+#[derive(Serialize, Debug)]
 pub struct Usage {
     pub today: Option<i64>,
+    pub today_complete_steps: i64,
+    pub today_incomplete_steps: i64,
+    pub today_incomplete_known: Option<TokenParts>,
+    pub today_legacy_steps: i64,
     pub latest: Option<i64>,
     pub latest_at: Option<i64>,
+    pub latest_at_ms: Option<i64>,
+    pub latest_incomplete: bool,
+    pub latest_parts: Option<TokenParts>,
+    pub latest_legacy: bool,
+    pub status: SourceStatus,
+}
+
+struct ParsedRecord {
+    session: String,
+    response: String,
+    at: i64,
+    at_ns: i64,
+    tokens: i64,
+    complete: bool,
+    input: Option<i64>,
+    cache_read: Option<i64>,
+    output: Option<i64>,
 }
 
 #[derive(Default)]
@@ -40,19 +72,32 @@ pub struct Monitor {
     recent: BTreeSet<(SystemTime, PathBuf)>,
     last_reconcile: Option<Instant>,
     codex_day_dirs: BTreeMap<PathBuf, SystemTime>,
+    antigravity_transcripts: BTreeMap<PathBuf, (SystemTime, u64)>,
     changes: Arc<Mutex<Changes>>,
 }
 
 impl Monitor {
     pub fn update(&mut self, store: &Store, id: &str, root: &Path) -> Result<Usage> {
         store.enabled_agent(id)?;
-        if !root.is_dir() {
-            self.watcher = None;
-            self.recent.clear();
-            self.codex_day_dirs.clear();
-            self.last_reconcile = None;
-            return totals(store, id);
+        match std::fs::metadata(root) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                self.reset_runtime();
+                return totals(store, id, SourceStatus::Waiting);
+            }
+            Err(e) => {
+                self.reset_runtime();
+                return Err(e).with_context(|| format!("无法访问日志目录 {}", root.display()));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                self.reset_runtime();
+                bail!("日志路径不是目录: {}", root.display());
+            }
+            Ok(_) => {}
         }
+        // Verify directory readability so permission errors are surfaced instead of silently ignored.
+        std::fs::read_dir(root)
+            .with_context(|| format!("无法读取日志目录 {}", root.display()))?;
+
         let reconcile = self
             .last_reconcile
             .is_none_or(|last| last.elapsed() >= RECONCILE_INTERVAL);
@@ -133,9 +178,39 @@ impl Monitor {
                 }
             }
             self.codex_day_dirs = day_dirs;
+        } else if id == "antigravity" {
+            // Antigravity writes `<brain>/<conv-id>/.system_generated/logs/transcript.jsonl`.
+            // Checking top-level conversation folders directly catches newly created hidden
+            // log trees and same-second appends even if FSEvents drops nested notifications.
+            let mut current = BTreeMap::new();
+            for transcript in discover_antigravity_transcripts(root)? {
+                match std::fs::metadata(&transcript) {
+                    Ok(meta) => {
+                        let sig = (meta.modified()?, meta.len());
+                        if self.antigravity_transcripts.get(&transcript) != Some(&sig) {
+                            pending.paths.insert(transcript.clone());
+                        }
+                        current.insert(transcript, sig);
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("无法读取日志文件 {}", transcript.display()))
+                    }
+                }
+            }
+            self.antigravity_transcripts = current;
         }
         self.sync(store, id, root, pending, reconcile)?;
-        totals(store, id)
+        totals(store, id, SourceStatus::Active)
+    }
+
+    fn reset_runtime(&mut self) {
+        self.watcher = None;
+        self.recent.clear();
+        self.codex_day_dirs.clear();
+        self.antigravity_transcripts.clear();
+        self.last_reconcile = None;
     }
 
     fn sync(
@@ -160,7 +235,7 @@ impl Monitor {
 
         let mut db = store.connect()?;
         for path in paths {
-            if let Err(error) = import(&mut db, id, &path, &mut self.recent) {
+            if let Err(error) = import(&mut db, id, root, &path, &mut self.recent) {
                 self.changes.lock().unwrap().all = true;
                 return Err(error);
             }
@@ -172,114 +247,355 @@ impl Monitor {
     }
 }
 
-fn totals(store: &Store, id: &str) -> Result<Usage> {
+fn totals(store: &Store, id: &str, status: SourceStatus) -> Result<Usage> {
     let db = store.connect()?;
-    let latest: Option<(i64, i64)> = db
-        .query_row(
-            "SELECT at,tokens FROM usage WHERE provider=?1 ORDER BY at DESC LIMIT 1",
+    // Latest step ordering:
+    // 1. Exact source timestamp preserving full sub-second precision (at_ns, falling back to at * 1e9 for legacy rows)
+    // 2. Deterministic total-order tie-breakers independent of import/file order:
+    //    session DESC, then numeric step index DESC (or lexical response DESC).
+    let latest: Option<(i64, Option<i64>, i64, i64, Option<i64>, Option<i64>, Option<i64>, i64)> =
+        db.query_row(
+            "SELECT at, at_ns, tokens, complete, input_tokens, cache_read_tokens, output_tokens, legacy
+             FROM usage
+             WHERE provider=?1
+             ORDER BY
+               COALESCE(at_ns, at * 1000000000) DESC,
+               session DESC,
+               CASE WHEN response GLOB '[0-9]*' AND response NOT GLOB '*[^0-9]*' THEN LENGTH(response) ELSE 0 END DESC,
+               response DESC
+             LIMIT 1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
         )
         .optional()?;
-    let today = chrono::Local::now().date_naive();
-    let start = today
+
+    let today_date = chrono::Local::now().date_naive();
+    let start = today_date
         .and_hms_opt(0, 0, 0)
         .and_then(|t| t.and_local_timezone(chrono::Local).earliest())
         .context("无法确定本地日期")?
         .timestamp();
-    let sum: i64 = db.query_row(
-        "SELECT COALESCE(SUM(tokens),0) FROM usage WHERE provider=?1 AND at>=?2",
+
+    let (today_complete_steps, today_complete_sum): (i64, i64) = db.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(tokens),0)
+         FROM usage
+         WHERE provider=?1 AND at>=?2 AND complete=1",
+        params![id, start],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+
+    let (
+        today_incomplete_steps,
+        inc_in_cnt,
+        inc_in_sum,
+        inc_cr_cnt,
+        inc_cr_sum,
+        inc_out_cnt,
+        inc_out_sum,
+    ): (i64, i64, i64, i64, i64, i64, i64) = db.query_row(
+        "SELECT
+            COUNT(*),
+            COUNT(input_tokens), COALESCE(SUM(input_tokens), 0),
+            COUNT(cache_read_tokens), COALESCE(SUM(cache_read_tokens), 0),
+            COUNT(output_tokens), COALESCE(SUM(output_tokens), 0)
+         FROM usage
+         WHERE provider=?1 AND at>=?2 AND complete=0",
+        params![id, start],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        },
+    )?;
+
+    let today_legacy_steps: i64 = db.query_row(
+        "SELECT COUNT(*) FROM usage WHERE provider=?1 AND at>=?2 AND legacy=1",
         params![id, start],
         |r| r.get(0),
     )?;
+
+    let has_any_complete: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage WHERE provider=?1 AND complete=1)",
+        [id],
+        |r| r.get(0),
+    )?;
+
+    // `today` sums complete steps only. When today has only incomplete steps (zero complete steps),
+    // return None rather than presenting a partial sum as a complete daily total.
+    let today = if today_complete_steps > 0 {
+        Some(today_complete_sum)
+    } else if today_incomplete_steps > 0 {
+        None
+    } else if has_any_complete {
+        Some(0)
+    } else {
+        None
+    };
+
+    let today_incomplete_known = if today_incomplete_steps > 0 {
+        Some(TokenParts {
+            input: (inc_in_cnt > 0).then_some(inc_in_sum),
+            cache_read: (inc_cr_cnt > 0).then_some(inc_cr_sum),
+            output: (inc_out_cnt > 0).then_some(inc_out_sum),
+        })
+    } else {
+        None
+    };
+
+    let (latest_val, latest_at, latest_at_ms, latest_incomplete, latest_parts, latest_legacy) =
+        match latest {
+            Some((at, at_ns, tokens, complete, inp, cr, out, legacy)) => {
+                let is_complete = complete == 1;
+                let parts = if !is_complete {
+                    Some(TokenParts {
+                        input: inp,
+                        cache_read: cr,
+                        output: out,
+                    })
+                } else {
+                    None
+                };
+                (
+                    is_complete.then_some(tokens),
+                    Some(at),
+                    Some(at_ns.map_or(at * 1000, |ns| ns / 1_000_000)),
+                    !is_complete,
+                    parts,
+                    legacy == 1,
+                )
+            }
+            None => (None, None, None, false, None, false),
+        };
+
     Ok(Usage {
-        today: latest.map(|_| sum),
-        latest: latest.map(|(_, t)| t),
-        latest_at: latest.map(|(t, _)| t),
+        today,
+        today_complete_steps,
+        today_incomplete_steps,
+        today_incomplete_known,
+        today_legacy_steps,
+        latest: latest_val,
+        latest_at,
+        latest_at_ms,
+        latest_incomplete,
+        latest_parts,
+        latest_legacy,
+        status,
     })
+}
+
+fn discover_antigravity_transcripts(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("无法读取日志目录 {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let transcript = path.join(".system_generated/logs/transcript.jsonl");
+        match std::fs::metadata(&transcript) {
+            Ok(meta) if meta.is_file() => found.push(transcript),
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("无法访问日志文件 {}", transcript.display()))
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+fn antigravity_conversation_id(base_root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(base_root).ok()?;
+    let parts: Vec<_> = rel.components().collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let [Component::Normal(conv), Component::Normal(sys), Component::Normal(logs), Component::Normal(file)] =
+        parts.as_slice()
+    else {
+        return None;
+    };
+    if *sys == ".system_generated" && *logs == "logs" && *file == "transcript.jsonl" {
+        Some(conv.to_string_lossy().into_owned())
+    } else {
+        None
+    }
 }
 
 fn import(
     db: &mut rusqlite::Connection,
     id: &str,
-    root: &Path,
+    base_root: &Path,
+    target: &Path,
     recent: &mut BTreeSet<(SystemTime, PathBuf)>,
 ) -> Result<()> {
-    if !root.exists() {
+    if !target.exists() {
         return Ok(());
     }
-    for entry in WalkDir::new(root) {
+    if id == "antigravity" {
+        let files = if target == base_root {
+            discover_antigravity_transcripts(base_root)?
+        } else if antigravity_conversation_id(base_root, target).is_some() {
+            vec![target.to_path_buf()]
+        } else if target.is_dir() {
+            if let Ok(rel) = target.strip_prefix(base_root) {
+                if let Some(Component::Normal(conv)) = rel.components().next() {
+                    let transcript = base_root
+                        .join(conv)
+                        .join(".system_generated/logs/transcript.jsonl");
+                    if transcript.is_file() {
+                        vec![transcript]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            // Ignore transcript_full.jsonl, chunks/*.jsonl, and unrelated files.
+            Vec::new()
+        };
+        for file_path in files {
+            let conv_id = antigravity_conversation_id(base_root, &file_path);
+            import_file(db, id, &file_path, conv_id.as_deref(), recent)?;
+        }
+        return Ok(());
+    }
+
+    for entry in WalkDir::new(target) {
         let entry = entry?;
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl")
         {
             continue;
         }
-        let path = entry.path();
-        let meta = match std::fs::metadata(path) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
-        };
-        let modified = meta.modified()?;
-        if recent.len() < HOT_LOG_LIMIT
-            || recent
-                .first()
-                .is_some_and(|(oldest, _)| modified >= *oldest)
-        {
-            recent.retain(|(_, p)| p != path);
-            recent.insert((modified, path.to_path_buf()));
-            if recent.len() > HOT_LOG_LIMIT {
-                recent.pop_first();
-            }
-        }
-        let fingerprint = file_id(&meta);
-        let key = path.to_string_lossy();
-        let cursor: Option<(String, i64)> = db
-            .query_row(
-                "SELECT fingerprint,pos FROM cursors WHERE provider=?1 AND path=?2",
-                params![id, key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let mut pos = cursor
-            .filter(|(f, p)| f == &fingerprint && *p >= 0 && *p as u64 <= meta.len())
-            .map_or(0, |(_, p)| p as u64);
-        if pos == meta.len() {
-            continue;
-        }
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
-        };
-        if file_id(&file.metadata()?) != fingerprint {
-            continue;
-        }
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(pos))?;
-        let tx = db.transaction()?;
-        let mut bytes = Vec::new();
-        loop {
-            bytes.clear();
-            let len = reader.read_until(b'\n', &mut bytes)?;
-            if len == 0 || bytes.last() != Some(&b'\n') {
-                break;
-            }
-            pos += len as u64;
-            if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
-                if let Some((session, response, at, tokens)) = record(id, &event) {
-                    tx.execute("INSERT INTO usage VALUES(?1,?2,?3,?4,?5)
-                        ON CONFLICT(provider,session,response) DO UPDATE SET at=excluded.at,tokens=excluded.tokens WHERE excluded.at>=usage.at",params![id,session,response,at,tokens])?;
-                }
-            }
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO cursors VALUES(?1,?2,?3,?4)",
-            params![id, key, fingerprint, i64::try_from(pos)?],
-        )?;
-        tx.commit()?;
+        import_file(db, id, entry.path(), None, recent)?;
     }
+    Ok(())
+}
+
+fn import_file(
+    db: &mut rusqlite::Connection,
+    id: &str,
+    path: &Path,
+    session_fallback: Option<&str>,
+    recent: &mut BTreeSet<(SystemTime, PathBuf)>,
+) -> Result<()> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("无法读取日志文件 {}", path.display())),
+    };
+    let modified = meta.modified()?;
+    if recent.len() < HOT_LOG_LIMIT
+        || recent
+            .first()
+            .is_some_and(|(oldest, _)| modified >= *oldest)
+    {
+        recent.retain(|(_, p)| p != path);
+        recent.insert((modified, path.to_path_buf()));
+        if recent.len() > HOT_LOG_LIMIT {
+            recent.pop_first();
+        }
+    }
+    let fingerprint = file_id(&meta);
+    let key = path.to_string_lossy();
+    let cursor: Option<(String, i64)> = db
+        .query_row(
+            "SELECT fingerprint,pos FROM cursors WHERE provider=?1 AND path=?2",
+            params![id, key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let mut pos = cursor
+        .filter(|(f, p)| f == &fingerprint && *p >= 0 && *p as u64 <= meta.len())
+        .map_or(0, |(_, p)| p as u64);
+    if pos == meta.len() {
+        return Ok(());
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("无法打开日志文件 {}", path.display())),
+    };
+    if file_id(&file.metadata()?) != fingerprint {
+        return Ok(());
+    }
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(pos))?;
+    let tx = db.transaction()?;
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        let len = reader.read_until(b'\n', &mut bytes)?;
+        if len == 0 || bytes.last() != Some(&b'\n') {
+            break;
+        }
+        pos += len as u64;
+        if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(rec) = record(id, session_fallback, &event) {
+                tx.execute(
+                    "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)
+                     ON CONFLICT(provider,session,response) DO UPDATE SET
+                        at=excluded.at,
+                        at_ns=excluded.at_ns,
+                        tokens=excluded.tokens,
+                        complete=excluded.complete,
+                        input_tokens=excluded.input_tokens,
+                        cache_read_tokens=excluded.cache_read_tokens,
+                        output_tokens=excluded.output_tokens,
+                        legacy=0
+                     WHERE usage.legacy=1
+                        OR (excluded.complete > usage.complete)
+                        OR (excluded.complete = usage.complete
+                            AND COALESCE(excluded.at_ns, excluded.at * 1000000000)
+                                >= COALESCE(usage.at_ns, usage.at * 1000000000))",
+                    params![
+                        id,
+                        rec.session,
+                        rec.response,
+                        rec.at,
+                        rec.tokens,
+                        rec.at_ns,
+                        i64::from(rec.complete),
+                        rec.input,
+                        rec.cache_read,
+                        rec.output,
+                    ],
+                )?;
+            }
+        }
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO cursors VALUES(?1,?2,?3,?4)",
+        params![id, key, fingerprint, i64::try_from(pos)?],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -294,28 +610,89 @@ fn file_id(meta: &std::fs::Metadata) -> String {
     format!("{:?}", meta.created().ok())
 }
 
-fn record<'a>(id: &str, event: &'a Value) -> Option<(&'a str, &'a str, i64, i64)> {
-    let at = chrono::DateTime::parse_from_rfc3339(event["timestamp"].as_str()?)
-        .ok()?
-        .timestamp();
+fn parse_rfc3339(raw: &str) -> Option<(i64, i64)> {
+    let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    let at = dt.timestamp();
+    let at_ns = dt.timestamp_nanos_opt()?;
+    Some((at, at_ns))
+}
+
+fn optional_nonneg_i64(event: &Value, key: &str) -> Result<Option<i64>, ()> {
+    match event.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_i64().filter(|&n| n >= 0).map(Some).ok_or(()),
+    }
+}
+
+fn record(id: &str, session_fallback: Option<&str>, event: &Value) -> Option<ParsedRecord> {
     match (id, event["type"].as_str()?) {
         ("codex", "token_usage_record") => {
+            let (at, at_ns) = parse_rfc3339(event["timestamp"].as_str()?)?;
             let p = &event["payload"];
-            Some((
-                p["session_id"].as_str()?,
-                p["response_id"].as_str()?,
+            let tokens = p["usage"]["total_tokens"].as_i64()?;
+            Some(ParsedRecord {
+                session: p["session_id"].as_str()?.to_string(),
+                response: p["response_id"].as_str()?.to_string(),
                 at,
-                p["usage"]["total_tokens"].as_i64()?,
-            ))
+                at_ns,
+                tokens,
+                complete: true,
+                input: p["usage"]["input_tokens"].as_i64(),
+                cache_read: p["usage"]["cached_input_tokens"].as_i64(),
+                output: p["usage"]["output_tokens"].as_i64(),
+            })
         }
         ("claude", "assistant") => {
+            let (at, at_ns) = parse_rfc3339(event["timestamp"].as_str()?)?;
             let m = &event["message"];
             let u = &m["usage"];
-            let total = u["input_tokens"].as_i64()?
-                + u["output_tokens"].as_i64()?
-                + u["cache_creation_input_tokens"].as_i64().unwrap_or(0)
-                + u["cache_read_input_tokens"].as_i64().unwrap_or(0);
-            Some((event["sessionId"].as_str()?, m["id"].as_str()?, at, total))
+            let input = u["input_tokens"].as_i64()?;
+            let output = u["output_tokens"].as_i64()?;
+            let cache_create = u["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+            let cache_read = u["cache_read_input_tokens"].as_i64().unwrap_or(0);
+            let total = input + output + cache_create + cache_read;
+            Some(ParsedRecord {
+                session: event["sessionId"].as_str()?.to_string(),
+                response: m["id"].as_str()?.to_string(),
+                at,
+                at_ns,
+                tokens: total,
+                complete: true,
+                input: Some(input),
+                cache_read: Some(cache_read),
+                output: Some(output),
+            })
+        }
+        ("antigravity", "PLANNER_RESPONSE") => {
+            if event["status"].as_str()? != "DONE" {
+                return None;
+            }
+            let (at, at_ns) = parse_rfc3339(event["created_at"].as_str()?)?;
+            let session = session_fallback?.to_string();
+            let step = event["step_index"].as_i64().filter(|&n| n >= 0)?;
+            let input = optional_nonneg_i64(event, "input_tokens").ok()?;
+            let cache_read = optional_nonneg_i64(event, "cache_read_tokens").ok()?;
+            let output = optional_nonneg_i64(event, "output_tokens").ok()?;
+            // Skip steps with zero token fields present; keep incomplete steps that have at least one known field.
+            if input.is_none() && cache_read.is_none() && output.is_none() {
+                return None;
+            }
+            let complete = input.is_some() && cache_read.is_some() && output.is_some();
+            let tokens = input
+                .unwrap_or(0)
+                .checked_add(cache_read.unwrap_or(0))?
+                .checked_add(output.unwrap_or(0))?;
+            Some(ParsedRecord {
+                session,
+                response: step.to_string(),
+                at,
+                at_ns,
+                tokens,
+                complete,
+                input,
+                cache_read,
+                output,
+            })
         }
         _ => None,
     }
@@ -346,7 +723,9 @@ mod tests {
         let path = root.join("rollout.jsonl");
         fs::write(&path, "{\"type\":\"session_meta\"}\n")?;
         let mut monitor = Monitor::default();
-        assert!(monitor.update(&store, "codex", &root)?.latest.is_none());
+        let initial = monitor.update(&store, "codex", &root)?;
+        assert!(initial.latest.is_none());
+        assert_eq!(initial.status, SourceStatus::Active);
         // Keep the cursor established at discovery, then suppress all OS notifications.
         drop(monitor.watcher.take());
         *monitor.changes.lock().unwrap() = Changes::default();

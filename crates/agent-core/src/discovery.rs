@@ -113,6 +113,12 @@ pub fn log_root(id: &str, home: &Path) -> Option<PathBuf> {
                 .unwrap_or_else(|| home.join(".claude"))
                 .join("projects"),
         ),
+        "antigravity" => Some(
+            env::var_os("ANTIGRAVITY_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".gemini/antigravity"))
+                .join("brain"),
+        ),
         _ => None,
     }
 }

@@ -109,6 +109,10 @@ fn classify_rpc_error(method: &str, err: &Value) -> String {
 }
 
 pub async fn query(binary: &Path) -> Result<Quota> {
+    query_with_timeout(binary, Duration::from_secs(20)).await
+}
+
+pub async fn query_with_timeout(binary: &Path, limit: Duration) -> Result<Quota> {
     ensure!(
         binary.is_file(),
         "未找到可执行的 Codex CLI（已记录路径不存在），请点击「重新扫描」"
@@ -154,7 +158,7 @@ pub async fn query(binary: &Path) -> Result<Quota> {
         output: BufReader::new(child.stdout.take().context("无法读取 Codex")?).lines(),
         seq: 0,
     };
-    let result = timeout(Duration::from_secs(20), async {
+    let result = timeout(limit, async {
         rpc.call(
             "initialize",
             json!({"clientInfo":{"name":"agent_use","version":"0.1.0"},"capabilities":{}}),
@@ -179,7 +183,7 @@ pub async fn query(binary: &Path) -> Result<Quota> {
     .await;
     drop(rpc);
     let _ = child.kill().await;
-    result.map_err(|_| anyhow!("Codex 网络查询超时，请检查网络后稍后再试"))?
+    result.map_err(|_| anyhow!("Codex 查询超时，请稍后重试"))?
 }
 
 fn normalize(account: &Value, limits: &Value) -> Result<Quota> {
