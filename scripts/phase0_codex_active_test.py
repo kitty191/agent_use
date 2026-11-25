@@ -366,42 +366,38 @@ def run_active_query(codex_bin: str) -> dict[str, Any]:
 def read_latest_log_rate_limit_snapshot(sessions_dir: Path) -> dict[str, Any]:
     if not sessions_dir.exists():
         return {"exists": False}
-    files = sorted(
-        sessions_dir.rglob("*.jsonl"),
-        key=lambda p: p.stat().st_mtime if p.exists() else 0,
-        reverse=True,
-    )
-    for fpath in files[:5]:
-        latest_rl = None
-        latest_ts = None
+    latest_time = None
+    snapshot = {"exists": True, "rate_limits": None}
+    for fpath in sessions_dir.rglob("*.jsonl"):
         try:
-            with fpath.open("r", encoding="utf-8", errors="ignore") as fh:
+            with fpath.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    line = line.strip()
-                    if not line:
+                    if '"rate_limits"' not in line:
                         continue
                     try:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if (
-                        isinstance(obj, dict)
-                        and obj.get("type") == "event_msg"
-                        and isinstance(obj.get("payload"), dict)
-                        and obj["payload"].get("type") == "token_count"
-                        and isinstance(obj["payload"].get("rate_limits"), dict)
-                    ):
-                        latest_rl = normalize_rate_limit_bucket(obj["payload"]["rate_limits"])
-                        latest_ts = obj.get("timestamp")
+                    if not isinstance(obj, dict) or obj.get("type") != "event_msg":
+                        continue
+                    payload = obj.get("payload")
+                    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                        continue
+                    limits = payload.get("rate_limits")
+                    timestamp = obj.get("timestamp")
+                    source_time = parse_iso_utc(timestamp) if isinstance(timestamp, str) else None
+                    if not isinstance(limits, dict) or source_time is None:
+                        continue
+                    if latest_time is None or source_time > latest_time:
+                        latest_time = source_time
+                        snapshot = {
+                            "exists": True,
+                            "source_timestamp": timestamp,
+                            "rate_limits": normalize_rate_limit_bucket(limits),
+                        }
         except OSError:
             continue
-        if latest_rl is not None:
-            return {
-                "exists": True,
-                "source_timestamp": latest_ts,
-                "rate_limits": latest_rl,
-            }
-    return {"exists": True, "rate_limits": None}
+    return snapshot
 
 
 def watch_single_request(sessions_dir: Path, timeout_sec: int, codex_bin: str) -> dict[str, Any]:

@@ -23,8 +23,12 @@
    - 样例 File 0（2026-10-11）包含 `primary (window_minutes: 300)` 与 `secondary (window_minutes: 10080)`；
    - 样例 File 1（2026-11-20）仅包含 `primary (window_minutes: 10080)` 且无 `secondary`。
    - **结论**：必须按 `window_minutes` 动态识别窗口类型（`300 -> 5 小时窗口`，`10080 -> 7 天周窗口`），不可硬编码字段名语义。
-5. **待补充核验项（Phase 0b）**：
-   - 账号标识与无新会话时的主动刷新：需核验 `codex login status` / `codex doctor` 输出及官方客户端同屏显示值对照。
+5. **Phase 0b 主动查询（用户提供的 macOS 真机结果）**
+   - Codex 0.154.0 的 app-server 通过 stdio 完成初始化。无需模型请求，`account/read`（`refreshToken: false`）返回当前 ChatGPT 账号及 Plus 套餐，耗时 6 ms。`account/rateLimits/read` 耗时 1562 ms。
+   - 返回的 7 天窗口已用 16%，用户核对官方显示剩余 84%。该样本未返回第二个窗口。接口给出的重置时间为 2026-11-29 14:57:17（UTC+8），与官方界面的时间对照仍待验收。
+   - 180 秒跨终端监听期间未捕获请求。真实落盘延迟和实时去重仍需在明确触发请求的情况下核对。
+   - 离线快照按额度事件自身的时间排序。旧日志追加设置记录也会改变文件修改时间。
+
 
 ---
 
@@ -58,8 +62,8 @@
 | **Codex** (`0.154.0`) | 本次请求 Token | **指定版本已实测** | 来自 `token_usage_record.payload.usage`，去重键 `(session_id, response_id)`；`cached_input` 含于 `input`，`reasoning_output` 含于 `output` |
 | **Codex** (`0.154.0`) | 累计 Token | **指定版本已实测** | 来自 `event_msg:token_count.info.total_token_usage`，或按 `token_usage_record` 聚合 |
 | **Codex** (`0.154.0`) | 套餐（Plan） | **指定版本已实测** | 来自 `event_msg:token_count.rate_limits.plan_type`（样例值 `plus`） |
-| **Codex** (`0.154.0`) | 额度百分比 & 重置时间 | **指定版本已实测**（日志结构）；同屏数值对照 **待验证** | 来自 `rate_limits.primary` / `secondary`，按 `window_minutes`（300 / 10080）动态分类，`resets_at` 为 Unix 秒级时间戳 |
-| **Codex** (`0.154.0`) | 当前账号 & 主动刷新 | **待验证** | 需 Phase 0b 核验 `codex login status` / `codex doctor` 及无新会话刷新方式 |
+| **Codex** (`0.154.0`) | 额度百分比 & 重置时间 | **指定版本已实测**（日志结构）；百分比 **已核对**，重置时间同屏 **待验证** | 来自 `rate_limits.primary` / `secondary`，按 `window_minutes`（300 / 10080）动态分类，`resets_at` 为 Unix 秒级时间戳 |
+| **Codex** (`0.154.0`) | 当前账号 & 主动刷新 | **指定版本已实测** | app-server 的 `account/read` 与 `account/rateLimits/read` 在无模型请求时返回当前账号与额度 |
 | **Claude Code** (`2.1.278`) | 本次请求 & 累计 Token | **指定版本已实测**（JSONL 结构） | 来自 `~/.claude/projects/**/*.jsonl` 的 `assistant` 记录，必须按 `(sessionId, message.id)` 去重；`cache_read`/`cache_creation` 不含于 `input_tokens` |
 | **Claude Code** (`2.1.278`) | 账号 / 套餐 / 额度 / 重置 / 主动刷新 | **待验证** | 本机 `claude` 不在默认 `PATH`，且存在第三方模型路由场景 |
 | **Antigravity** (`2.35.1`) | 全部字段（账号 / 模型池 / 额度 / 重置 / Token） | **待验证** | 已确认 Desktop App `2.35.1` 运行形态；受支持的官方只读查询入口待 Phase 0b 核验 |

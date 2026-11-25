@@ -1,0 +1,15 @@
+[package]
+name = "agent-use"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agent-core = { path = "../crates/agent-core" }
+tauri = { version = "2", features = [] }
+
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

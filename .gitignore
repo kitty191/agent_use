@@ -13,3 +13,6 @@ Thumbs.db
 /dist/
 *.sqlite
 *.db
+
+/src-tauri/gen/
+__pycache__/

@@ -143,11 +143,11 @@ flowchart TD
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Codex** | 本次请求 Token | 本地 session JSONL `token_usage_record`（去重键 `session_id + response_id`，按 `turn_id` 关联 `turn_context.model`） | `codex-cli 0.154.0`（macOS arm64） | 否（读本机已有日志） | 否 | **指定版本已实测**（确认 `cached_input` 含于 `input`、`reasoning_output` 含于 `output`；绝不与 `event_msg:token_count` 重复累加） |
 | **Codex** | 累计 Token | session JSONL `event_msg:token_count.info.total_token_usage` 或按 `token_usage_record` 聚合 | `codex-cli 0.154.0`（macOS arm64） | 否（读日志） | 否 | **指定版本已实测**（日志结构）；**官方有说明**（[Codex CLI 命令参考](https://learn.chatgpt.com/docs/developer-commands)）；同屏对照 **待验证** |
-| **Codex** | 当前账号 | 官方 CLI 受支持账号状态入口（如 `codex login status` / `codex doctor`，避免解析 `auth.json`） | `codex-cli 0.154.0` | 需官方客户端已登录 | 待验证 | **待验证**（Phase 0b 核验） |
+| **Codex** | 当前账号 | app-server `account/read` | `codex-cli 0.154.0`（macOS arm64） | 需官方客户端已登录 | 经本机 CLI | **指定版本已实测** |
 | **Codex** | 套餐（Plan） | session JSONL `rate_limits.plan_type` | `codex-cli 0.154.0`（macOS arm64） | 需官方客户端已登录 | 否（读日志） | **指定版本已实测**（样例值 `plus`） |
-| **Codex** | 额度百分比 | session JSONL `rate_limits.primary` / `secondary.used_percent`（按 `window_minutes` 动态区分 300=5h / 10080=7d） | `codex-cli 0.154.0`（macOS arm64） | 需官方客户端已登录 | 读日志否 / 主动查询是 | **指定版本已实测**（日志结构，且证实 `primary` 可能直接是 10080 分钟周窗口）；官方同屏数值对照 **待验证** |
+| **Codex** | 额度百分比 | session JSONL `rate_limits.primary` / `secondary.used_percent`（按 `window_minutes` 动态区分 300=5h / 10080=7d） | `codex-cli 0.154.0`（macOS arm64） | 需官方客户端已登录 | 读日志否 / 主动查询是 | **指定版本已实测**（日志结构，且证实 `primary` 可能直接是 10080 分钟周窗口）；主动查询已用 16% 与官方剩余 84% **已核对** |
 | **Codex** | 重置时间 | session JSONL `rate_limits.*.resets_at`（Unix 秒级时间戳） | `codex-cli 0.154.0`（macOS arm64） | 需官方客户端已登录 | 读日志否 / 主动查询是 | **指定版本已实测**（日志结构）；官方同屏数值对照 **待验证** |
-| **Codex** | 主动刷新能力 | 无新会话时通过官方受支持命令/入口拉取 | `codex-cli 0.154.0` | 需官方客户端已登录 | 是 | **待验证**（Phase 0b 核验） |
+| **Codex** | 主动刷新能力 | app-server `account/rateLimits/read` | `codex-cli 0.154.0`（macOS arm64） | 需官方客户端已登录 | 是 | **指定版本已实测**，无需发起模型请求 |
 | **Claude Code** | 本次请求 Token | 本地 JSONL `~/.claude/projects/**/*.jsonl` 的 `assistant` 记录（去重键 `sessionId + message.id`） | Claude Code `2.1.278`（macOS arm64，本机未在默认 PATH） | 否（读本机已有日志） | 否 | **指定版本已实测**（证实同一回复会写 2–3 条不同 `uuid` 但同 `message.id` 的记录；且 `cache_read` / `cache_creation` **不含于** `input_tokens`；需兼容第三方模型路由） |
 | **Claude Code** | 累计 Token | 本地 JSONL 去重汇总 / 官方 `/usage` 命令 | Claude Code `2.1.278` | 否（读日志）/ 需官方 CLI 已登录 | 否（读日志） | **指定版本已实测**（JSONL 去重汇总）；**官方有说明**（[Claude Code Costs & `/usage`](https://code.claude.com/docs/en/costs)）；`cost-state` 字段 **待验证** |
 | **Claude Code** | 当前账号 | 官方受支持状态命令 / 本地非敏感配置 | Claude Code `2.1.278` | 需官方客户端已登录 | 待验证 | **官方有说明**认证机制（[Authentication](https://code.claude.com/docs/en/authentication)）；非交互读取 **待验证** |
@@ -343,6 +343,6 @@ flowchart LR
 
 | 平台 | 规划展示字段（缺省项自动留空 `—`） | 用户需要做什么 | 数据更新频率 | 当前仍待 Phase 0 验证的部分 |
 | :--- | :--- | :--- | :--- | :--- |
-| **OpenAI Codex** | 单次/累计 Token（含缓存与推理拆分）、等效 API 成本、当前账号与套餐、5h/周额度百分比与预计重置倒计时、活跃会话 | 在本机正常使用已登录的 Codex CLI；在监控软件引导页勾选 Codex（如日志在自定义目录或 WSL 则指定目录） | 本地日志落盘后目标 **2 秒内**更新；无新会话时按低频策略或手动刷新检查快照；倒计时本地逐秒更新 | 1. session JSONL 单次与累计字段、缓存/推理包含关系；<br>2. 官方受支持账号与套餐查询入口；<br>3. 无新会话时能否主动拉取新 `rate_limits` 快照 |
+| **OpenAI Codex** | 单次/累计 Token（含缓存与推理拆分）、等效 API 成本、当前账号与套餐、5h/周额度百分比与预计重置倒计时、活跃会话 | 在本机正常使用已登录的 Codex CLI；在监控软件引导页勾选 Codex（如日志在自定义目录或 WSL 则指定目录） | 本地日志落盘后目标 **2 秒内**更新；无新会话时按低频策略或手动刷新检查快照；倒计时本地逐秒更新 | 重置时间与官方界面对照；另一终端明确发起请求后的捕获延迟及去重 |
 | **Claude Code** | 单次/累计 Token（Input / Output / Cache Read / Cache Write）、等效 API 成本、活跃会话；当前账号、套餐、5h/周额度百分比与重置倒计时（视 Phase 0 结论开放） | 在本机正常使用已登录的 Claude Code；勾选 Claude Code（若启用在线额度检查，软件会明示联网用途） | 本地 JSONL 落盘后目标 **2 秒内**更新；在线额度检查遵循低频节流（活跃 3–5 分钟、空闲 10–15 分钟）与服务端限流退避 | 1. 同一请求多条 JSONL 记录的去重主键与最终值口径；<br>2. `/usage` 或其他官方入口是否存在受支持的非交互读取方式与限流表现；<br>3. 当前账号与套餐的非交互获取方式 |
 | **Google Antigravity** | 按模型池拆分的剩余/已用额度百分比与各自重置倒计时、当前账号与套餐；本地 Token 明细（仅在存在受支持来源时展示，否则缺省 `—`） | 在本机正常使用已登录的 Antigravity IDE 或 CLI；勾选 Antigravity（不要求为查看本机数据额外登录 Google） | 受支持查询按低频节流或手动刷新更新；客户端退出/离线时展示上次快照与本地倒计时，到点后等待重新同步确认 | 1. CLI `/usage`（`/quota`）、`/credits`、`/statusline` 的适用版本与非交互可读性；<br>2. 本机 Language Server 是否具备受支持查询边界；<br>3. 是否存在可靠的账号归属与 Token 明细来源 |
