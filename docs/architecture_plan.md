@@ -3,7 +3,7 @@
 > **定位**：一款**免注册、纯本地统计、可控联网**的跨平台桌面监控软件（交付 **macOS / Windows / Linux** 三端原生安装包）。采用 **Tauri 2 + Rust + React + TypeScript + SQLite**，提供**系统托盘/菜单栏迷你浮窗**与**完整监控主面板**双窗口体验，首批覆盖 **OpenAI Codex**、**Claude Code** 与 **Google Antigravity**。
 
 > [!IMPORTANT]
-> **事实与验证口径声明**：本文档严格区分三类信息状态——**「官方有说明」**（附官方文档链接）、**「指定版本已实测」**（需经 Phase 0 真机对照完成，当前修订稿阶段**暂无已完成项**）与**「待验证」**（仅有社区实现或尚未在真机采集脱敏样例）。任何「待验证」能力均不得提前承诺为首版必然可用功能。
+> **事实与验证口径声明**：本文档严格区分三类信息状态——**「官方有说明」**（附官方文档链接）、**「指定版本已实测」**（已于 `macOS 26.5.2 arm64` 完成首轮脱敏样例核验，详见 [phase0_verification_report.md](phase0_verification_report.md)）与**「待验证」**（尚未实机核对或待官方同屏显示值对照）。任何「待验证」能力均不得提前承诺为首版必然可用功能。
 
 ---
 
@@ -128,33 +128,33 @@ flowchart TD
 2. 三个平台的**脱敏真机样例集（Fixtures）**（不含任何 prompt、回复正文、邮箱原文或令牌），直接沉淀为 `agent-core` 单元测试资产。
 3. **官方客户端显示值对照报告**：将本工具解析结果与官方 CLI / IDE 同屏显示的用量、百分比、重置时间逐字段核对，记录误差与缺失项。
 
-### 3.2 初始能力矩阵（Phase 0 核验前基线）
+### 3.2 能力矩阵（已同步 macOS `26.5.2 arm64` Phase 0a 实测结果）
 
-> 状态标记说明：`官方有说明` = 官方文档明确描述该能力；`指定版本已实测` = 已在真机完成对照验收（**当前均为 0 项**）；`待验证` = 仅有社区实践、未公开格式或尚未实机核对。
+> 状态标记说明：`官方有说明` = 官方文档明确描述该能力；`指定版本已实测` = 已在真机通过脱敏样例核验字段结构与口径（详见 [phase0_verification_report.md](phase0_verification_report.md)）；`待验证` = 尚未完成实机读取或官方同屏数值对照。
 
 | 平台 | 能力项 | 候选数据来源 | 适用客户端与版本 | 是否需要登录 | 是否会联网 | 验证状态与参考 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Codex** | 本次请求 Token | 本地 session JSONL | Codex CLI（版本待 Phase 0 记录） | 否（读本机已有日志） | 否 | **待验证**（需核对单次增量 vs 累计字段） |
-| **Codex** | 累计 Token | 本地 session JSONL / 官方 CLI 状态命令 | Codex CLI（版本待记录） | 否（读日志）/ 需官方 CLI 已登录 | 否（读日志）/ 待确认（CLI） | **官方有说明**（[Codex CLI 命令参考](https://learn.chatgpt.com/docs/developer-commands)）；日志结构 **待验证** |
-| **Codex** | 当前账号 | 官方 CLI 受支持账号状态入口（避免解析凭证文件） | Codex CLI / IDE 扩展（版本待记录） | 需官方客户端已登录 | 待验证 | **待验证** |
-| **Codex** | 套餐（Plan） | 官方 CLI 状态输出 / session 快照 | Codex CLI（版本待记录） | 需官方客户端已登录 | 待验证 | **待验证** |
-| **Codex** | 额度百分比 | session JSONL `rate_limits` 快照 / 官方 CLI 状态入口 | Codex CLI（版本待记录） | 需官方客户端已登录 | 读日志否 / 主动查询是 | **待验证**（含 5h 与周窗口口径） |
-| **Codex** | 重置时间 | session JSONL `rate_limits.resets_at` / 官方 CLI | Codex CLI（版本待记录） | 需官方客户端已登录 | 读日志否 / 主动查询是 | **待验证** |
-| **Codex** | 主动刷新能力 | 无新会话时通过官方受支持命令/入口拉取 | Codex CLI（版本待记录） | 需官方客户端已登录 | 是 | **待验证** |
-| **Claude Code** | 本次请求 Token | 本地 JSONL 日志（`~/.claude/...`） | Claude Code CLI（版本待记录） | 否（读本机已有日志） | 否 | **待验证**（需核对同一请求多条记录去重） |
-| **Claude Code** | 累计 Token | 本地 JSONL 汇总 / 官方 `/usage` 命令 | Claude Code CLI（版本待记录） | 否（读日志）/ 需官方 CLI 已登录 | 否（读日志） | **官方有说明**（[Claude Code Costs & `/usage`](https://code.claude.com/docs/en/costs)）；JSONL 字段 **待验证** |
-| **Claude Code** | 当前账号 | 官方受支持状态命令 / 本地非敏感配置 | Claude Code CLI（版本待记录） | 需官方客户端已登录 | 待验证 | **官方有说明**认证机制（[Authentication](https://code.claude.com/docs/en/authentication)）；非交互读取 **待验证** |
-| **Claude Code** | 套餐（Plan） | 官方状态输出 / `/usage` | Claude Code CLI（版本待记录） | 需官方客户端已登录 | 待验证 | **待验证** |
-| **Claude Code** | 额度百分比 | 官方 `/usage`（待核验非交互方式） | Claude Code CLI（版本待记录） | 需官方客户端已登录 | 是 | **官方有说明**存在 5h 与周限额且跨端共享（[Usage Limits](https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work)、[Paid Plans Reset](https://support.claude.com/en/articles/12429409-manage-usage-credits-for-paid-claude-plans)）；非交互读取 **待验证** |
-| **Claude Code** | 重置时间 | 官方 `/usage`（不采用本机首条 prompt 推算） | Claude Code CLI（版本待记录） | 需官方客户端已登录 | 是 | **待验证** |
-| **Claude Code** | 主动刷新能力 | 受支持的非交互 CLI 查询（遵守限流） | Claude Code CLI（版本待记录） | 需官方客户端已登录 | 是 | **待验证**（需确认无高频 429 副作用） |
-| **Antigravity** | 本次请求 Token | 本机受支持状态/日志（如 `/statusline` payload 或本地统计） | Antigravity CLI / IDE（版本待记录） | 待验证 | 否 | **待验证**（允许缺省） |
-| **Antigravity** | 累计 Token | 本机受支持状态/日志或官方命令 | Antigravity CLI / IDE（版本待记录） | 待验证 | 待验证 | **待验证**（允许缺省） |
-| **Antigravity** | 当前账号 | 官方受支持 CLI 状态 / IDE 运行态（需确认授权边界） | Antigravity CLI / IDE（版本待记录） | 需官方客户端已登录 | 待验证 | **待验证** |
-| **Antigravity** | 套餐（Plan） | 官方受支持 CLI `/usage` / `/credits` | Antigravity CLI / IDE（版本待记录） | 需官方客户端已登录 | 待验证 | **官方有说明**存在 `/credits` 与 `/usage`（[Antigravity `/credits`](https://antigravity.google/docs/cli/commands/credits/)）；非交互输出 **待验证** |
-| **Antigravity** | 额度百分比 | 官方 CLI `/usage`（别名 `/quota`）按模型池展示；本机 Language Server 需先确认授权与协议边界 | Antigravity CLI / IDE（版本待记录） | 需官方客户端已登录 | 是（或经官方本地进程同步） | **官方有说明**交互命令（[Antigravity `/usage`](https://antigravity.google/docs/cli/commands/usage/)、[Antigravity `/statusline`](https://antigravity.google/docs/cli/commands/statusline/)）；非交互与本地进程授权 **待验证** |
-| **Antigravity** | 重置时间 | 官方 CLI `/usage`（按模型池独立重置时间） | Antigravity CLI / IDE（版本待记录） | 需官方客户端已登录 | 同上 | **待验证** |
-| **Antigravity** | 主动刷新能力 | 受支持的官方 CLI 查询或受控本地状态读取 | Antigravity CLI / IDE（版本待记录） | 需官方客户端已登录 | 是 | **待验证** |
+| **Codex** | 本次请求 Token | 本地 session JSONL `token_usage_record`（去重键 `session_id + response_id`，按 `turn_id` 关联 `turn_context.model`） | `codex-cli 0.154.0`（macOS arm64） | 否（读本机已有日志） | 否 | **指定版本已实测**（确认 `cached_input` 含于 `input`、`reasoning_output` 含于 `output`；绝不与 `event_msg:token_count` 重复累加） |
+| **Codex** | 累计 Token | session JSONL `event_msg:token_count.info.total_token_usage` 或按 `token_usage_record` 聚合 | `codex-cli 0.154.0`（macOS arm64） | 否（读日志） | 否 | **指定版本已实测**（日志结构）；**官方有说明**（[Codex CLI 命令参考](https://learn.chatgpt.com/docs/developer-commands)）；同屏对照 **待验证** |
+| **Codex** | 当前账号 | 官方 CLI 受支持账号状态入口（如 `codex login status` / `codex doctor`，避免解析 `auth.json`） | `codex-cli 0.154.0` | 需官方客户端已登录 | 待验证 | **待验证**（Phase 0b 核验） |
+| **Codex** | 套餐（Plan） | session JSONL `rate_limits.plan_type` | `codex-cli 0.154.0`（macOS arm64） | 需官方客户端已登录 | 否（读日志） | **指定版本已实测**（样例值 `plus`） |
+| **Codex** | 额度百分比 | session JSONL `rate_limits.primary` / `secondary.used_percent`（按 `window_minutes` 动态区分 300=5h / 10080=7d） | `codex-cli 0.154.0`（macOS arm64） | 需官方客户端已登录 | 读日志否 / 主动查询是 | **指定版本已实测**（日志结构，且证实 `primary` 可能直接是 10080 分钟周窗口）；官方同屏数值对照 **待验证** |
+| **Codex** | 重置时间 | session JSONL `rate_limits.*.resets_at`（Unix 秒级时间戳） | `codex-cli 0.154.0`（macOS arm64） | 需官方客户端已登录 | 读日志否 / 主动查询是 | **指定版本已实测**（日志结构）；官方同屏数值对照 **待验证** |
+| **Codex** | 主动刷新能力 | 无新会话时通过官方受支持命令/入口拉取 | `codex-cli 0.154.0` | 需官方客户端已登录 | 是 | **待验证**（Phase 0b 核验） |
+| **Claude Code** | 本次请求 Token | 本地 JSONL `~/.claude/projects/**/*.jsonl` 的 `assistant` 记录（去重键 `sessionId + message.id`） | Claude Code `2.1.278`（macOS arm64，本机未在默认 PATH） | 否（读本机已有日志） | 否 | **指定版本已实测**（证实同一回复会写 2–3 条不同 `uuid` 但同 `message.id` 的记录；且 `cache_read` / `cache_creation` **不含于** `input_tokens`；需兼容第三方模型路由） |
+| **Claude Code** | 累计 Token | 本地 JSONL 去重汇总 / 官方 `/usage` 命令 | Claude Code `2.1.278` | 否（读日志）/ 需官方 CLI 已登录 | 否（读日志） | **指定版本已实测**（JSONL 去重汇总）；**官方有说明**（[Claude Code Costs & `/usage`](https://code.claude.com/docs/en/costs)）；`cost-state` 字段 **待验证** |
+| **Claude Code** | 当前账号 | 官方受支持状态命令 / 本地非敏感配置 | Claude Code `2.1.278` | 需官方客户端已登录 | 待验证 | **官方有说明**认证机制（[Authentication](https://code.claude.com/docs/en/authentication)）；非交互读取 **待验证** |
+| **Claude Code** | 套餐（Plan） | 官方状态输出 / `/usage` | Claude Code `2.1.278` | 需官方客户端已登录 | 待验证 | **待验证** |
+| **Claude Code** | 额度百分比 | 官方 `/usage`（待核验非交互方式） | Claude Code `2.1.278` | 需官方客户端已登录 | 是 | **官方有说明**存在 5h 与周限额且跨端共享（[Usage Limits](https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work)、[Paid Plans Reset](https://support.claude.com/en/articles/12429409-manage-usage-credits-for-paid-claude-plans)）；非交互读取 **待验证** |
+| **Claude Code** | 重置时间 | 官方 `/usage`（不采用本机首条 prompt 推算） | Claude Code `2.1.278` | 需官方客户端已登录 | 是 | **待验证** |
+| **Claude Code** | 主动刷新能力 | 受支持的非交互 CLI 查询（遵守限流） | Claude Code `2.1.278` | 需官方客户端已登录 | 是 | **待验证**（需确认无高频 429 副作用） |
+| **Antigravity** | 本次请求 Token | 本机受支持状态/日志（如 `/statusline` payload 或本地统计） | Antigravity Desktop `2.35.1`（`com.google.antigravity`，默认 PATH 无 CLI） | 待验证 | 否 | **待验证**（允许缺省） |
+| **Antigravity** | 累计 Token | 本机受支持状态/日志或官方命令 | Antigravity Desktop `2.35.1` | 待验证 | 待验证 | **待验证**（允许缺省） |
+| **Antigravity** | 当前账号 | 官方受支持 CLI 状态 / IDE 受授权入口 | Antigravity Desktop `2.35.1` | 需官方客户端已登录 | 待验证 | **待验证** |
+| **Antigravity** | 套餐（Plan） | 官方受支持 CLI `/usage` / `/credits` | Antigravity Desktop `2.35.1` | 需官方客户端已登录 | 待验证 | **官方有说明**存在 `/credits` 与 `/usage`（[Antigravity `/credits`](https://antigravity.google/docs/cli/commands/credits/)）；非交互输出 **待验证** |
+| **Antigravity** | 额度百分比 | 官方 CLI `/usage`（别名 `/quota`）按模型池展示；已确认本机存在 `language_server` 进程与 `Application Support/Antigravity/bin`，但尚未确认第三方查询授权 | Antigravity Desktop `2.35.1` | 需官方客户端已登录 | 是（或经官方本地进程同步） | **官方有说明**交互命令（[Antigravity `/usage`](https://antigravity.google/docs/cli/commands/usage/)、[Antigravity `/statusline`](https://antigravity.google/docs/cli/commands/statusline/)）；非交互与授权边界 **待验证** |
+| **Antigravity** | 重置时间 | 官方 CLI `/usage`（按模型池独立重置时间） | Antigravity Desktop `2.35.1` | 需官方客户端已登录 | 同上 | **待验证** |
+| **Antigravity** | 主动刷新能力 | 受支持的官方 CLI 查询或受控本地状态读取 | Antigravity Desktop `2.35.1` | 需官方客户端已登录 | 是 | **待验证** |
 
 ---
 
