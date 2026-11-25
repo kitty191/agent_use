@@ -1,0 +1,5 @@
+{
+  "build": {
+    "beforeDevCommand": "vite --config scripts/verify-codex-ui.vite.mjs --port 1420 --strictPort"
+  }
+}

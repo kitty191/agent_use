@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --port 1420 --strictPort",
     "build": "tsc --noEmit && vite build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "verify:codex": "tauri dev --config scripts/verify-codex-ui.tauri.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -206,7 +206,8 @@ function UsagePanel({ agent }: { agent: Agent }) {
         if (active) setErr(String(e));
       }
       reading = false;
-      if (active) timer = window.setTimeout(read, 2000);
+      // Leave time within the two-second display target for IPC and WebView rendering.
+      if (active) timer = window.setTimeout(read, 1000);
     }
     function onVisible() {
       if (document.visibilityState === "visible") void read();
@@ -222,7 +223,7 @@ function UsagePanel({ agent }: { agent: Agent }) {
     };
   }, [agent.id, supported]);
   return (
-    <article className="usage panel">
+    <article className="usage panel" data-provider={agent.id} data-latest-at={usage?.latest_at}>
       <header>
         <h3>{agent.name}</h3>
         <span className="state">{statusText(agent)}</span>

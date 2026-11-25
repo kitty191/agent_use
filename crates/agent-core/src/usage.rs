@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
@@ -39,6 +39,7 @@ pub struct Monitor {
     watcher: Option<RecommendedWatcher>,
     recent: BTreeSet<(SystemTime, PathBuf)>,
     last_reconcile: Option<Instant>,
+    codex_day_dirs: BTreeMap<PathBuf, SystemTime>,
     changes: Arc<Mutex<Changes>>,
 }
 
@@ -48,6 +49,7 @@ impl Monitor {
         if !root.is_dir() {
             self.watcher = None;
             self.recent.clear();
+            self.codex_day_dirs.clear();
             self.last_reconcile = None;
             return totals(store, id);
         }
@@ -56,7 +58,31 @@ impl Monitor {
             .is_none_or(|last| last.elapsed() >= RECONCILE_INTERVAL);
         if reconcile && self.watcher.is_none() {
             let queue = self.changes.clone();
+            let trace = cfg!(debug_assertions)
+                && id == "codex"
+                && std::env::var_os("AGENT_USE_TRACE_CODEX").is_some();
+            let watch_root = root.to_path_buf();
+            if trace {
+                eprintln!("[usage-watch] root={}", watch_root.display());
+            }
             let watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+                if trace {
+                    match &event {
+                        Ok(event) => {
+                            let paths: Vec<_> = event
+                                .paths
+                                .iter()
+                                .map(|p| p.strip_prefix(&watch_root).unwrap_or(p))
+                                .collect();
+                            eprintln!(
+                                "[usage-watch] {:?} paths={paths:?} rescan={}",
+                                event.kind,
+                                event.need_rescan()
+                            );
+                        }
+                        Err(error) => eprintln!("[usage-watch] {error}"),
+                    }
+                }
                 let mut pending = queue.lock().unwrap();
                 match event {
                     Ok(e) if e.need_rescan() => pending.all = true,
@@ -87,7 +113,27 @@ impl Monitor {
                 }
             }
         }
-        let pending = std::mem::take(&mut *self.changes.lock().unwrap());
+        let mut pending = std::mem::take(&mut *self.changes.lock().unwrap());
+        if id == "codex" {
+            // A new rollout is not in the hot-file set yet. Directory mtime changes
+            // on creation/rename even if the OS coalesces or drops the file event.
+            let now = chrono::Utc::now();
+            let dates = [
+                now.with_timezone(&chrono::Local).date_naive(),
+                now.date_naive(),
+            ];
+            let mut day_dirs = BTreeMap::new();
+            for date in dates.into_iter().collect::<BTreeSet<_>>() {
+                let day = root.join(date.format("%Y/%m/%d").to_string());
+                if let Ok(stamp) = day.metadata().and_then(|m| m.modified()) {
+                    if self.codex_day_dirs.get(&day) != Some(&stamp) {
+                        pending.paths.insert(day.clone());
+                    }
+                    day_dirs.insert(day, stamp);
+                }
+            }
+            self.codex_day_dirs = day_dirs;
+        }
         self.sync(store, id, root, pending, reconcile)?;
         totals(store, id)
     }
@@ -295,7 +341,7 @@ mod tests {
             }]
         })?;
         store.select(vec!["codex".into()])?;
-        let root = dir.path().join("sessions/2026/11/25");
+        let root = dir.path().join("sessions");
         fs::create_dir_all(&root)?;
         let path = root.join("rollout.jsonl");
         fs::write(&path, "{\"type\":\"session_meta\"}\n")?;
@@ -329,11 +375,10 @@ mod tests {
             assert_eq!(usage.latest, Some(19926));
         }
 
-        // A missed create in an unobserved directory is recovered on reconciliation.
-        let nested = root.join("other");
-        fs::create_dir(&nested)?;
+        // Even without a create event, discover today’s dated directory on the next poll.
+        let nested = root.join(today.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&nested)?;
         fs::write(nested.join("new.jsonl"), format!("{}\n", event(4, 1)))?;
-        monitor.last_reconcile = Some(Instant::now() - RECONCILE_INTERVAL);
         let usage = monitor.update(&store, "codex", &root)?;
         assert_eq!(usage.today, Some(59730));
         assert_eq!(usage.latest, Some(1));

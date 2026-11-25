@@ -122,3 +122,81 @@ for line in sys.stdin:
     assert_eq!(100.0 - q.windows[0].used, 84.0);
     Ok(())
 }
+
+#[test]
+fn codex_live_rollout_in_new_date_directory_counts_each_response_once() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("monitor.sqlite"))?;
+    store.settings(false, || vec![agent("codex", "installed")])?;
+    store.select(vec!["codex".into()])?;
+
+    let sessions = dir.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let mut mon = Monitor::default();
+    assert_eq!(mon.update(&store, "codex", &sessions)?.today, None);
+    let date_dir = sessions.join(chrono::Local::now().format("%Y/%m/%d").to_string());
+    fs::create_dir_all(&date_dir)?;
+    let rollout = date_dir.join("rollout-example.jsonl");
+    let mut writer = fs::File::create(&rollout)?;
+    writeln!(
+        writer,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":"sample-session"}})
+    )?;
+    let mut total = 0;
+    for (n, tokens) in [19895, 19908, 19926].into_iter().enumerate() {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let counters = json!({"input_tokens":tokens-5,"cached_input_tokens":0,"output_tokens":5,
+                              "reasoning_output_tokens":0,"total_tokens":tokens});
+        total += tokens;
+        let response = format!("sample-response-{n}");
+        let record = json!({"type":"token_usage_record","timestamp":timestamp,"payload":{
+            "session_id":"sample-session","thread_id":"sample-thread","response_id":response,
+            "turn_id":format!("turn-{n}"),"root_turn_id":format!("turn-{n}"),
+            "usage":counters,"turn_token_usage":counters,"thread_token_usage":{"total_tokens":total}
+        }});
+        let summary = json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count",
+            "info":{"last_token_usage":counters,"total_token_usage":{"total_tokens":total},
+                    "model_context_window":128000},"rate_limits":null}});
+        // While a JSONL line is incomplete, the cursor must stop before the line.
+        write!(writer, "{record}")?;
+        writer.flush()?;
+        assert_eq!(
+            mon.update(&store, "codex", &sessions)?.today,
+            (n > 0).then_some(total - tokens)
+        );
+        writeln!(writer)?;
+        writeln!(writer, "{summary}")?;
+        writeln!(writer, "{record}")?;
+        writer.flush()?;
+        let start = Instant::now();
+        loop {
+            let state = mon.update(&store, "codex", &sessions)?;
+            anyhow::ensure!(
+                start.elapsed() < Duration::from_secs(2),
+                "complete line missed the two-second backend budget"
+            );
+            if state.today == Some(total) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let db = store.connect()?;
+        let (rows,stored):(i64,i64)=db.query_row(
+            "SELECT COUNT(*), SUM(tokens) FROM usage WHERE provider='codex' AND session='sample-session' AND response=?1",
+            [&response],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        assert_eq!((rows, stored), (1, tokens));
+        let cursor: i64 = db.query_row(
+            "SELECT pos FROM cursors WHERE provider='codex' AND path=?1",
+            [rollout.to_str().unwrap()],
+            |r| r.get(0),
+        )?;
+        assert_eq!(cursor as u64, writer.metadata()?.len());
+    }
+    assert_eq!(total, 59729);
+    assert_eq!(
+        Monitor::default().update(&store, "codex", &sessions)?.today,
+        Some(59729)
+    );
+    Ok(())
+}
