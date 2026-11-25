@@ -1,5 +1,6 @@
 # Phase 0 local probe outputs (do not commit raw reports)
 phase0_report*.json
+phase0_codex*.json
 
 # OS / Editor
 .DS_Store
