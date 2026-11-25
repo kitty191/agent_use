@@ -21,7 +21,7 @@ npm run tauri dev
 - **Codex / Claude Code**：首次读取已启用来源的 JSONL，之后通过文件系统事件增量更新。面板也会检查最近使用的日志是否增长，每 30 秒校验已启用平台的日志目录，以补读遗漏的文件。面板显示本机今日 Token 与最近一次响应。缺少记录的字段显示为「—」。
 - **Antigravity、DeepSeek 桌面端等**：当前展示本机发现状态，账号、Token 和额度采集取决于各自数据源后续验证。
 
-核心验证可运行 `cargo test -p agent-core` 和 `python3 scripts/test_phase0_snapshot.py`。macOS 官方重置时间已核对至分钟，跨终端用量补读延迟仍待真机复测。
+核心验证可运行 `cargo test -p agent-core` 和 `python3 scripts/test_phase0_snapshot.py`。macOS 官方重置时间已核对至分钟，一次跨终端真机验收中，19,618 Token 只计一次，前台界面更新延迟上界为 538 ms。
 
 ### 真机验证跨终端更新
 
