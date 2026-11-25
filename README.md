@@ -18,10 +18,10 @@ npm run tauri dev
 首次启动会检查注册清单内的应用、CLI 和数据目录。确认选择后才启用平台。SQLite 保存扫描结果（含空结果）、已选项、本机用量游标和最近一次成功的 Codex 额度快照。再次启动直接恢复面板；安装或移除工具后点击「重新扫描」更新列表。
 
 - **Codex**：启动、手动刷新及每五分钟通过本机 app-server 查询当前账号和额度，按返回窗口时长显示剩余百分比与重置倒计时。查询失败时，已有快照保留其原账号标签和查询时间。
-- **Codex / Claude Code**：首次读取已启用来源的 JSONL，之后通过文件系统事件增量更新。面板显示本机今日 Token 与最近一次响应。缺少记录的字段显示为「—」。
+- **Codex / Claude Code**：首次读取已启用来源的 JSONL，之后通过文件系统事件增量更新。面板也会检查最近使用的日志是否增长，每 30 秒校验已启用平台的日志目录，以补读遗漏的文件。面板显示本机今日 Token 与最近一次响应。缺少记录的字段显示为「—」。
 - **Antigravity、DeepSeek 桌面端等**：当前展示本机发现状态，账号、Token 和额度采集取决于各自数据源后续验证。
 
-核心验证可运行 `cargo test -p agent-core` 和 `python3 scripts/test_phase0_snapshot.py`。macOS 官方重置时间对照及跨终端用量捕获延迟仍待真机验收。
+核心验证可运行 `cargo test -p agent-core` 和 `python3 scripts/test_phase0_snapshot.py`。macOS 官方重置时间已核对至分钟，跨终端用量补读延迟仍待真机复测。
 
 ## Phase 0 数据源探测
 

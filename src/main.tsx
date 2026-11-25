@@ -191,9 +191,11 @@ function UsagePanel({ agent }: { agent: Agent }) {
   const supported = ["codex", "claude"].includes(agent.id);
   useEffect(() => {
     if (!supported) return;
-    let active = true,
-      timer = 0;
+    let active = true, reading = false, timer = 0;
     async function read() {
+      if (!active || reading) return;
+      window.clearTimeout(timer);
+      reading = true;
       try {
         const u = await invoke<Usage>("local_usage", { id: agent.id });
         if (active) {
@@ -203,11 +205,19 @@ function UsagePanel({ agent }: { agent: Agent }) {
       } catch (e) {
         if (active) setErr(String(e));
       }
+      reading = false;
       if (active) timer = window.setTimeout(read, 2000);
     }
+    function onVisible() {
+      if (document.visibilityState === "visible") void read();
+    }
+    window.addEventListener("focus", onVisible);
+    document.addEventListener("visibilitychange", onVisible);
     void read();
     return () => {
       active = false;
+      window.removeEventListener("focus", onVisible);
+      document.removeEventListener("visibilitychange", onVisible);
       window.clearTimeout(timer);
     };
   }, [agent.id, supported]);
