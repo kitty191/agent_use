@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use agent_core::{
-    discovery, quota,
+    discovery, history, quota,
     store::{Settings, Store},
     usage,
 };
@@ -78,6 +78,27 @@ async fn local_usage(app: State<'_, App>, id: String) -> Result<usage::Usage, St
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+fn usage_history(
+    app: State<App>,
+    granularity: String,
+    offset: u32,
+    provider: Option<String>,
+    range_start: Option<String>,
+    range_end: Option<String>,
+) -> Result<history::HistoryPage, String> {
+    let gran = history::Granularity::parse(&granularity).map_err(|e| e.to_string())?;
+    history::query(
+        &app.db,
+        gran,
+        offset,
+        provider.as_deref(),
+        range_start.as_deref(),
+        range_end.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -100,7 +121,8 @@ fn main() {
             save_selection,
             last_quota,
             refresh_quota,
-            local_usage
+            local_usage,
+            usage_history
         ])
         .run(tauri::generate_context!())
         .expect("启动 Agent Use 失败");

@@ -35,12 +35,14 @@ pub struct Usage {
     pub today_incomplete_steps: i64,
     pub today_incomplete_known: Option<TokenParts>,
     pub today_legacy_steps: i64,
+    pub today_legacy_tokens: Option<i64>,
     pub latest: Option<i64>,
     pub latest_at: Option<i64>,
     pub latest_at_ms: Option<i64>,
     pub latest_incomplete: bool,
     pub latest_parts: Option<TokenParts>,
     pub latest_legacy: bool,
+    pub latest_legacy_tokens: Option<i64>,
     pub status: SourceStatus,
 }
 
@@ -281,17 +283,18 @@ fn totals(store: &Store, id: &str, status: SourceStatus) -> Result<Usage> {
         .optional()?;
 
     let today_date = chrono::Local::now().date_naive();
-    let start = today_date
-        .and_hms_opt(0, 0, 0)
-        .and_then(|t| t.and_local_timezone(chrono::Local).earliest())
-        .context("无法确定本地日期")?
-        .timestamp();
+    let start = crate::history::local_day_start_sec(today_date, &chrono::Local)?;
+    let next_day = today_date
+        .succ_opt()
+        .context("无法计算下一本地日期")?;
+    let end = crate::history::local_day_start_sec(next_day, &chrono::Local)?;
 
+    // Primary verified total strictly includes verified complete non-legacy rows only.
     let (today_complete_steps, today_complete_sum): (i64, i64) = db.query_row(
         "SELECT COUNT(*), COALESCE(SUM(tokens),0)
          FROM usage
-         WHERE provider=?1 AND at>=?2 AND complete=1",
-        params![id, start],
+         WHERE provider=?1 AND at>=?2 AND at<?3 AND complete=1 AND legacy=0",
+        params![id, start, end],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
 
@@ -310,8 +313,8 @@ fn totals(store: &Store, id: &str, status: SourceStatus) -> Result<Usage> {
             COUNT(cache_read_tokens), COALESCE(SUM(cache_read_tokens), 0),
             COUNT(output_tokens), COALESCE(SUM(output_tokens), 0)
          FROM usage
-         WHERE provider=?1 AND at>=?2 AND complete=0",
-        params![id, start],
+         WHERE provider=?1 AND at>=?2 AND at<?3 AND complete=0 AND legacy=0",
+        params![id, start, end],
         |r| {
             Ok((
                 r.get(0)?,
@@ -325,25 +328,30 @@ fn totals(store: &Store, id: &str, status: SourceStatus) -> Result<Usage> {
         },
     )?;
 
-    let today_legacy_steps: i64 = db.query_row(
-        "SELECT COUNT(*) FROM usage WHERE provider=?1 AND at>=?2 AND legacy=1",
-        params![id, start],
-        |r| r.get(0),
+    let (today_legacy_steps, today_legacy_sum): (i64, i64) = db.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(tokens),0)
+         FROM usage
+         WHERE provider=?1 AND at>=?2 AND at<?3 AND legacy=1",
+        params![id, start, end],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
 
-    let has_any_complete: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM usage WHERE provider=?1 AND complete=1)",
+    let has_any_verified: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage WHERE provider=?1 AND complete=1 AND legacy=0)",
         [id],
         |r| r.get(0),
     )?;
 
-    // `today` sums complete steps only. When today has only incomplete steps (zero complete steps),
-    // return None rather than presenting a partial sum as a complete daily total.
+    // `today` sums verified complete non-legacy steps only.
+    // - If verified steps exist today -> Some(sum) (including real 0).
+    // - Else if today has only incomplete or legacy steps -> None (don't pretend partial/unverified is complete).
+    // - Else if verified history exists on other days -> Some(0).
+    // - Else -> None.
     let today = if today_complete_steps > 0 {
         Some(today_complete_sum)
-    } else if today_incomplete_steps > 0 {
+    } else if today_incomplete_steps > 0 || today_legacy_steps > 0 {
         None
-    } else if has_any_complete {
+    } else if has_any_verified {
         Some(0)
     } else {
         None
@@ -359,30 +367,40 @@ fn totals(store: &Store, id: &str, status: SourceStatus) -> Result<Usage> {
         None
     };
 
-    let (latest_val, latest_at, latest_at_ms, latest_incomplete, latest_parts, latest_legacy) =
-        match latest {
-            Some((at, at_ns, tokens, complete, inp, cr, out, legacy)) => {
-                let is_complete = complete == 1;
-                let parts = if !is_complete {
-                    Some(TokenParts {
-                        input: inp,
-                        cache_read: cr,
-                        output: out,
-                    })
-                } else {
-                    None
-                };
-                (
-                    is_complete.then_some(tokens),
-                    Some(at),
-                    Some(at_ns.map_or(at * 1000, |ns| ns / 1_000_000)),
-                    !is_complete,
-                    parts,
-                    legacy == 1,
-                )
-            }
-            None => (None, None, None, false, None, false),
-        };
+    let (
+        latest_val,
+        latest_at,
+        latest_at_ms,
+        latest_incomplete,
+        latest_parts,
+        latest_legacy,
+        latest_legacy_tokens,
+    ) = match latest {
+        Some((at, at_ns, tokens, complete, inp, cr, out, legacy)) => {
+            let is_legacy = legacy == 1;
+            let is_verified_complete = !is_legacy && complete == 1;
+            let is_incomplete = !is_legacy && complete == 0;
+            let parts = if is_incomplete {
+                Some(TokenParts {
+                    input: inp,
+                    cache_read: cr,
+                    output: out,
+                })
+            } else {
+                None
+            };
+            (
+                is_verified_complete.then_some(tokens),
+                Some(at),
+                Some(at_ns.map_or(at * 1000, |ns| ns / 1_000_000)),
+                is_incomplete,
+                parts,
+                is_legacy,
+                is_legacy.then_some(tokens),
+            )
+        }
+        None => (None, None, None, false, None, false, None),
+    };
 
     Ok(Usage {
         today,
@@ -390,12 +408,14 @@ fn totals(store: &Store, id: &str, status: SourceStatus) -> Result<Usage> {
         today_incomplete_steps,
         today_incomplete_known,
         today_legacy_steps,
+        today_legacy_tokens: (today_legacy_steps > 0).then_some(today_legacy_sum),
         latest: latest_val,
         latest_at,
         latest_at_ms,
         latest_incomplete,
         latest_parts,
         latest_legacy,
+        latest_legacy_tokens,
         status,
     })
 }
@@ -498,6 +518,124 @@ fn import(
     Ok(())
 }
 
+fn upsert_antigravity_record(tx: &rusqlite::Transaction<'_>, rec: &ParsedRecord) -> Result<()> {
+    let existing: Option<(i64, Option<i64>, i64, i64, Option<i64>, Option<i64>, Option<i64>, i64)> =
+        tx.query_row(
+            "SELECT at, at_ns, tokens, complete, input_tokens, cache_read_tokens, output_tokens, legacy
+             FROM usage
+             WHERE provider='antigravity' AND session=?1 AND response=?2",
+            params![rec.session, rec.response],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let (at, at_ns, tokens, complete, input, cache_read, output) = match existing {
+        None => (
+            rec.at,
+            rec.at_ns,
+            rec.tokens,
+            rec.complete,
+            rec.input,
+            rec.cache_read,
+            rec.output,
+        ),
+        Some((_, _, _, _, _, _, _, 1)) => {
+            // Legacy pre-upgrade row being backfilled from the on-disk transcript: replace cleanly.
+            (
+                rec.at,
+                rec.at_ns,
+                rec.tokens,
+                rec.complete,
+                rec.input,
+                rec.cache_read,
+                rec.output,
+            )
+        }
+        Some((ex_at, ex_at_ns, _ex_tokens, ex_complete, ex_in, ex_cr, ex_out, _)) => {
+            let ex_ns = ex_at_ns.unwrap_or(ex_at.saturating_mul(1_000_000_000));
+            if ex_complete == 1 {
+                // Never downgrade a confirmed complete step with an incomplete replay.
+                if !rec.complete {
+                    return Ok(());
+                }
+                if rec.at_ns < ex_ns {
+                    return Ok(());
+                }
+                // Preserve the earliest observed step timestamp so delayed updates stay in the original day/week/month.
+                let (keep_at, keep_ns) = if rec.at_ns < ex_ns {
+                    (rec.at, rec.at_ns)
+                } else {
+                    (ex_at, ex_ns)
+                };
+                (
+                    keep_at,
+                    keep_ns,
+                    rec.tokens,
+                    true,
+                    rec.input,
+                    rec.cache_read,
+                    rec.output,
+                )
+            } else {
+                // Field-level merge across partial backfills of the same step.
+                let (m_in, m_cr, m_out) = if rec.at_ns >= ex_ns {
+                    (
+                        rec.input.or(ex_in),
+                        rec.cache_read.or(ex_cr),
+                        rec.output.or(ex_out),
+                    )
+                } else {
+                    (
+                        ex_in.or(rec.input),
+                        ex_cr.or(rec.cache_read),
+                        ex_out.or(rec.output),
+                    )
+                };
+                let complete = m_in.is_some() && m_cr.is_some() && m_out.is_some();
+                let tokens = m_in
+                    .unwrap_or(0)
+                    .saturating_add(m_cr.unwrap_or(0))
+                    .saturating_add(m_out.unwrap_or(0));
+                // Keep earliest source timestamp so a later backfill (e.g. Dec 1) stays in the step's original period (e.g. Nov 29).
+                let (keep_at, keep_ns) = if rec.at_ns < ex_ns {
+                    (rec.at, rec.at_ns)
+                } else {
+                    (ex_at, ex_ns)
+                };
+                (keep_at, keep_ns, tokens, complete, m_in, m_cr, m_out)
+            }
+        }
+    };
+
+    tx.execute(
+        "INSERT OR REPLACE INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
+         VALUES('antigravity',?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",
+        params![
+            rec.session,
+            rec.response,
+            at,
+            tokens,
+            at_ns,
+            i64::from(complete),
+            input,
+            cache_read,
+            output,
+        ],
+    )?;
+    Ok(())
+}
+
 fn import_file(
     db: &mut rusqlite::Connection,
     id: &str,
@@ -558,36 +696,37 @@ fn import_file(
         pos += len as u64;
         if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(rec) = record(id, session_fallback, &event) {
-                tx.execute(
-                    "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)
-                     ON CONFLICT(provider,session,response) DO UPDATE SET
-                        at=excluded.at,
-                        at_ns=excluded.at_ns,
-                        tokens=excluded.tokens,
-                        complete=excluded.complete,
-                        input_tokens=excluded.input_tokens,
-                        cache_read_tokens=excluded.cache_read_tokens,
-                        output_tokens=excluded.output_tokens,
-                        legacy=0
-                     WHERE usage.legacy=1
-                        OR (excluded.complete > usage.complete)
-                        OR (excluded.complete = usage.complete
-                            AND COALESCE(excluded.at_ns, excluded.at * 1000000000)
-                                >= COALESCE(usage.at_ns, usage.at * 1000000000))",
-                    params![
-                        id,
-                        rec.session,
-                        rec.response,
-                        rec.at,
-                        rec.tokens,
-                        rec.at_ns,
-                        i64::from(rec.complete),
-                        rec.input,
-                        rec.cache_read,
-                        rec.output,
-                    ],
-                )?;
+                if id == "antigravity" {
+                    upsert_antigravity_record(&tx, &rec)?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)
+                         ON CONFLICT(provider,session,response) DO UPDATE SET
+                            at=excluded.at,
+                            at_ns=excluded.at_ns,
+                            tokens=excluded.tokens,
+                            complete=excluded.complete,
+                            input_tokens=excluded.input_tokens,
+                            cache_read_tokens=excluded.cache_read_tokens,
+                            output_tokens=excluded.output_tokens,
+                            legacy=0
+                         WHERE COALESCE(excluded.at_ns, excluded.at * 1000000000)
+                                >= COALESCE(usage.at_ns, usage.at * 1000000000)",
+                        params![
+                            id,
+                            rec.session,
+                            rec.response,
+                            rec.at,
+                            rec.tokens,
+                            rec.at_ns,
+                            i64::from(rec.complete),
+                            rec.input,
+                            rec.cache_read,
+                            rec.output,
+                        ],
+                    )?;
+                }
             }
         }
     }
@@ -673,10 +812,7 @@ fn record(id: &str, session_fallback: Option<&str>, event: &Value) -> Option<Par
             let input = optional_nonneg_i64(event, "input_tokens").ok()?;
             let cache_read = optional_nonneg_i64(event, "cache_read_tokens").ok()?;
             let output = optional_nonneg_i64(event, "output_tokens").ok()?;
-            // Skip steps with zero token fields present; keep incomplete steps that have at least one known field.
-            if input.is_none() && cache_read.is_none() && output.is_none() {
-                return None;
-            }
+            // Retain DONE steps even when all three token fields are missing, marked incomplete (unknown).
             let complete = input.is_some() && cache_read.is_some() && output.is_some();
             let tokens = input
                 .unwrap_or(0)

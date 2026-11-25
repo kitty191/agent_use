@@ -1,5 +1,6 @@
 use agent_core::{
     discovery::Agent,
+    history::{self, Granularity},
     quota,
     store::Store,
     usage::{Monitor, SourceStatus},
@@ -943,14 +944,15 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
     // Run Antigravity monitor after upgrade:
     // - conv-a & conv-b recover sub-second precision -> latest = 200 (conv-b 10:00:01.900)
     // - conv-c is corrected from false-complete 320 to incomplete (today_incomplete_steps = 1)
-    // - conv-deleted is preserved as legacy history (777 tokens, today_legacy_steps = 1)
-    // - complete today sum = 100 + 200 + 777 = 1077 (no doubling!)
+    // - conv-deleted is preserved SEPARATELY as legacy history (777 tokens, today_legacy_steps = 1)
+    // - verified complete today sum = 100 + 200 = 300 (legacy 777 is NOT mixed into verified sum!)
     let u_after = Monitor::default().update(&store, "antigravity", &brain)?;
     assert_eq!(u_after.latest, Some(200));
-    assert_eq!(u_after.today, Some(1077));
-    assert_eq!(u_after.today_complete_steps, 3);
+    assert_eq!(u_after.today, Some(300));
+    assert_eq!(u_after.today_complete_steps, 2);
     assert_eq!(u_after.today_incomplete_steps, 1);
     assert_eq!(u_after.today_legacy_steps, 1);
+    assert_eq!(u_after.today_legacy_tokens, Some(777));
     assert!(!u_after.latest_incomplete);
 
     let ag_row_count: i64 = store
@@ -969,9 +971,18 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
 
     let u_reopened = Monitor::default().update(&store_reopened, "antigravity", &brain)?;
     assert_eq!(u_reopened.latest, Some(200));
-    assert_eq!(u_reopened.today, Some(1077));
+    assert_eq!(u_reopened.today, Some(300));
     assert_eq!(u_reopened.today_incomplete_steps, 1);
     assert_eq!(u_reopened.today_legacy_steps, 1);
+    assert_eq!(u_reopened.today_legacy_tokens, Some(777));
+
+    // Also verify History daily/weekly/monthly totals do not double across reopens.
+    let hist_day = history::query(&store_reopened, Granularity::Day, 0, Some("antigravity"), None, None)?;
+    let today_bucket = hist_day.buckets.last().unwrap();
+    assert_eq!(today_bucket.verified_tokens, Some(300));
+    assert_eq!(today_bucket.incomplete_steps, 1);
+    assert_eq!(today_bucket.legacy_steps, 1);
+    assert_eq!(today_bucket.legacy_tokens, Some(777));
 
     // Codex history remained untouched (5000, legacy = 0).
     let (codex_tokens, codex_legacy): (i64, i64) = store_reopened.connect()?.query_row(
@@ -981,5 +992,365 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
     )?;
     assert_eq!((codex_tokens, codex_legacy), (5000, 0));
 
+    Ok(())
+}
+
+#[test]
+fn history_cross_day_week_month_and_cross_year_boundaries() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate, TimeZone};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("monitor.sqlite"))?;
+    store.settings(false, || vec![agent("codex", "installed")])?;
+    store.select(vec!["codex".into()])?;
+
+    let sessions = dir.path().join("sessions");
+    fs::create_dir_all(&sessions)?;
+    let write_ev = |id: &str, rfc: &str, tokens: i64| {
+        json!({
+            "type": "token_usage_record",
+            "timestamp": rfc,
+            "payload": {"session_id": "s1", "response_id": id, "usage": {"total_tokens": tokens}}
+        })
+    };
+    fs::write(
+        sessions.join("boundaries.jsonl"),
+        [
+            // Cross-year: 2025-12-31 23:59:59+08:00 (50) and 2026-01-01 00:00:00+08:00 (75)
+            write_ev("y1", "2025-12-31T23:59:59+08:00", 50),
+            write_ev("y2", "2026-01-01T00:00:00+08:00", 75),
+            // Acceptance example: 2026-11-29 Sun 23:59:59 (100), 11-30 Mon 00:00:00 (200), 12-01 Tue 00:00:00 (300)
+            write_ev("r1", "2026-11-29T23:59:59+08:00", 100),
+            write_ev("r2", "2026-11-30T00:00:00+08:00", 200),
+            write_ev("r3", "2026-12-01T00:00:00+08:00", 300),
+        ]
+        .map(|v| v.to_string())
+        .join("\n")
+            + "\n",
+    )?;
+    Monitor::default().update(&store, "codex", &sessions)?;
+
+    let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+
+    // Daily check: 11-29 = 100, 11-30 = 200, 12-01 = 300
+    let day_page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+    assert_eq!(day_page.buckets.len(), 30);
+    assert!(day_page.has_older);
+    assert!(!day_page.has_newer);
+    let by_day = |k: &str| day_page.buckets.iter().find(|b| b.key == k).unwrap().verified_tokens;
+    assert_eq!(by_day("2026-11-29"), Some(100));
+    assert_eq!(by_day("2026-11-30"), Some(200));
+    assert_eq!(by_day("2026-12-01"), Some(300));
+
+    // Weekly check (Monday start): 11-23..11-29 = 100, 11-30..12-06 = 500 (is_current)
+    let week_page = history::query_with_tz(&store, Granularity::Week, 0, None, None, None, today, &tz)?;
+    assert_eq!(week_page.buckets.len(), 12);
+    let w_prev = week_page.buckets.iter().find(|b| b.key == "2026-11-23..2026-11-29").unwrap();
+    let w_curr = week_page.buckets.iter().find(|b| b.key == "2026-11-30..2026-12-06").unwrap();
+    assert_eq!(w_prev.verified_tokens, Some(100));
+    assert!(!w_prev.is_current);
+    assert_eq!(w_curr.verified_tokens, Some(500));
+    assert!(w_curr.is_current);
+
+    // Drill-down on current week sums to 500
+    let w_drill = history::query_with_tz(
+        &store,
+        Granularity::Day,
+        0,
+        None,
+        Some(NaiveDate::from_ymd_opt(2026, 11, 30).unwrap()),
+        Some(NaiveDate::from_ymd_opt(2026, 12, 6).unwrap()),
+        today,
+        &tz,
+    )?;
+    assert_eq!(w_drill.summary.verified_tokens, Some(500));
+
+    // Monthly check: 2026-11 = 300, 2026-12 = 300, 2026-01 = 75; page offset=1 reaches 2025-12 = 50
+    let month_page = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
+    assert_eq!(month_page.buckets.len(), 12);
+    assert!(month_page.has_older);
+    let by_month = |k: &str| month_page.buckets.iter().find(|b| b.key == k).unwrap().verified_tokens;
+    assert_eq!(by_month("2026-01"), Some(75));
+    assert_eq!(by_month("2026-11"), Some(300));
+    assert_eq!(by_month("2026-12"), Some(300));
+
+    let older_months = history::query_with_tz(&store, Granularity::Month, 1, None, None, None, today, &tz)?;
+    assert!(older_months.has_newer);
+    assert!(!older_months.has_older);
+    assert_eq!(
+        older_months.buckets.iter().find(|b| b.key == "2025-12").unwrap().verified_tokens,
+        Some(50)
+    );
+    let _ = tz.timestamp_opt(0, 0);
+    Ok(())
+}
+
+#[test]
+fn history_partial_backfill_merges_fields_and_preserves_original_date() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("monitor.sqlite"))?;
+    store.settings(false, || vec![agent("antigravity", "installed")])?;
+    store.select(vec!["antigravity".into()])?;
+
+    let brain = dir.path().join("brain");
+    let logs = brain.join("conv-backfill/.system_generated/logs");
+    fs::create_dir_all(&logs)?;
+    let transcript = logs.join("transcript.jsonl");
+
+    // Nov 29 reports input=300, output=20 (no cache_read_tokens)
+    let mut f = fs::File::create(&transcript)?;
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 5,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-29T10:00:00+08:00",
+            "input_tokens": 300,
+            "output_tokens": 20
+        })
+    )?;
+    f.flush()?;
+
+    let mut mon = Monitor::default();
+    mon.update(&store, "antigravity", &brain)?;
+
+    // Dec 1 backfills ONLY cache_read_tokens=100 for the same step
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 5,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-12-01T10:00:00+08:00",
+            "cache_read_tokens": 100
+        })
+    )?;
+    f.flush()?;
+    mon.update(&store, "antigravity", &brain)?;
+
+    let count: i64 = store
+        .connect()?
+        .query_row("SELECT COUNT(*) FROM usage WHERE provider='antigravity'", [], |r| r.get(0))?;
+    assert_eq!(count, 1);
+
+    let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let day_page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+    assert_eq!(
+        day_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap().verified_tokens,
+        Some(420)
+    );
+    assert_eq!(
+        day_page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap().verified_tokens,
+        None
+    );
+
+    let week_page = history::query_with_tz(&store, Granularity::Week, 0, None, None, None, today, &tz)?;
+    assert_eq!(
+        week_page.buckets.iter().find(|b| b.key == "2026-11-23..2026-11-29").unwrap().verified_tokens,
+        Some(420)
+    );
+    assert_eq!(
+        week_page.buckets.iter().find(|b| b.key == "2026-11-30..2026-12-06").unwrap().verified_tokens,
+        None
+    );
+
+    let month_page = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
+    assert_eq!(
+        month_page.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens,
+        Some(420)
+    );
+    assert_eq!(
+        month_page.buckets.iter().find(|b| b.key == "2026-12").unwrap().verified_tokens,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn history_distinguishes_empty_zero_all_missing_legacy_and_disabled_provider() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("monitor.sqlite"))?;
+    store.settings(false, || {
+        vec![agent("codex", "installed"), agent("antigravity", "installed")]
+    })?;
+    store.select(vec!["codex".into(), "antigravity".into()])?;
+
+    let brain = dir.path().join("brain");
+    let logs = brain.join("conv-states/.system_generated/logs");
+    fs::create_dir_all(&logs)?;
+    // Day 2026-11-21: empty (no record)
+    // Day 2026-11-22: explicit zero (0, 0, 0)
+    // Day 2026-11-23: DONE step with all 3 token fields missing
+    // Day 2026-11-24: legacy-only row inserted directly (simulating deleted source log)
+    // Day 2026-11-25: Codex 100 + Antigravity 200 -> All = 300
+    fs::write(
+        logs.join("transcript.jsonl"),
+        [
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-22T10:00:00+08:00", "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-23T10:00:00+08:00"}),
+            json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-25T10:00:00+08:00", "input_tokens": 150, "cache_read_tokens": 30, "output_tokens": 20}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n")
+            + "\n",
+    )?;
+    Monitor::default().update(&store, "antigravity", &brain)?;
+
+    let codex_dir = dir.path().join("codex-sessions");
+    fs::create_dir_all(&codex_dir)?;
+    fs::write(
+        codex_dir.join("rollout.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "type": "token_usage_record",
+                "timestamp": "2026-11-25T11:00:00+08:00",
+                "payload": {"session_id": "s1", "response_id": "r1", "usage": {"total_tokens": 100}}
+            })
+        ),
+    )?;
+    Monitor::default().update(&store, "codex", &codex_dir)?;
+
+    // Insert a legacy-only Antigravity row on 2026-11-24
+    let legacy_ts = chrono::DateTime::parse_from_rfc3339("2026-11-24T12:00:00+08:00")?.timestamp();
+    store.connect()?.execute(
+        "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,legacy)
+         VALUES('antigravity','deleted-conv','1',?1,777,NULL,1,1)",
+        [legacy_ts],
+    )?;
+
+    let today = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
+    let page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+    let bucket = |k: &str| page.buckets.iter().find(|b| b.key == k).unwrap();
+
+    // 1. Empty
+    let b21 = bucket("2026-11-21");
+    assert_eq!((b21.verified_tokens, b21.incomplete_steps, b21.legacy_steps), (None, 0, 0));
+    // 2. Explicit zero
+    let b22 = bucket("2026-11-22");
+    assert_eq!((b22.verified_tokens, b22.verified_steps, b22.incomplete_steps), (Some(0), 1, 0));
+    // 3. All 3 fields missing -> preserved as incomplete with incomplete_known = None
+    let b23 = bucket("2026-11-23");
+    assert_eq!(b23.verified_tokens, None);
+    assert_eq!(b23.incomplete_steps, 1);
+    assert_eq!(b23.incomplete_known, None);
+    // 4. Legacy-only -> separated from verified_tokens, legacy_tokens = Some(777)
+    let b24 = bucket("2026-11-24");
+    assert_eq!(b24.verified_tokens, None);
+    assert_eq!(b24.legacy_steps, 1);
+    assert_eq!(b24.legacy_tokens, Some(777));
+    // 5. Codex 100 + Antigravity 200 -> All = 300
+    let b25 = bucket("2026-11-25");
+    assert_eq!(b25.verified_tokens, Some(300));
+    assert_eq!(b25.providers.len(), 2);
+
+    // Disable Antigravity: its saved 200 must still be queryable without re-enabling collection!
+    store.select(vec!["codex".into()])?;
+    let ag_only = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
+    assert_eq!(
+        ag_only.buckets.iter().find(|b| b.key == "2026-11-25").unwrap().verified_tokens,
+        Some(200)
+    );
+    assert!(
+        !ag_only
+            .available_providers
+            .iter()
+            .find(|p| p.id == "antigravity")
+            .unwrap()
+            .enabled
+    );
+    assert!(store.enabled_agent("antigravity").is_err());
+    Ok(())
+}
+
+#[test]
+fn history_dst_23h_and_25h_days_do_not_assume_86400_seconds() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
+
+    // Minimal US-like DST timezone:
+    // - Spring forward: 2026-03-08 02:00 EST (-5) -> 03:00 EDT (-4) (23-hour day)
+    // - Fall back:      2026-11-01 02:00 EDT (-4) -> 01:00 EST (-5) (25-hour day)
+    #[derive(Clone, Copy)]
+    struct MockDstTz;
+    impl MockDstTz {
+        fn is_dst_utc(utc_ts: i64) -> bool {
+            // 2026-03-08 07:00:00Z .. 2026-11-01 06:00:00Z
+            let start = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap().and_hms_opt(7, 0, 0).unwrap().and_utc().timestamp();
+            let end = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap().and_hms_opt(6, 0, 0).unwrap().and_utc().timestamp();
+            utc_ts >= start && utc_ts < end
+        }
+    }
+    impl TimeZone for MockDstTz {
+        type Offset = FixedOffset;
+        fn from_offset(_offset: &Self::Offset) -> Self { MockDstTz }
+        fn offset_from_local_date(&self, local: &NaiveDate) -> LocalResult<Self::Offset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
+        }
+        fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<Self::Offset> {
+            let est = FixedOffset::west_opt(5 * 3600).unwrap();
+            let edt = FixedOffset::west_opt(4 * 3600).unwrap();
+            let est_utc = local.and_utc().timestamp() + 5 * 3600;
+            let edt_utc = local.and_utc().timestamp() + 4 * 3600;
+            let valid_est = !Self::is_dst_utc(est_utc);
+            let valid_edt = Self::is_dst_utc(edt_utc);
+            match (valid_edt, valid_est) {
+                (true, false) => LocalResult::Single(edt),
+                (false, true) => LocalResult::Single(est),
+                (true, true) => LocalResult::Ambiguous(edt, est),
+                (false, false) => LocalResult::None,
+            }
+        }
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> Self::Offset {
+            self.offset_from_utc_datetime(&utc.and_hms_opt(0, 0, 0).unwrap())
+        }
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> Self::Offset {
+            if Self::is_dst_utc(utc.and_utc().timestamp()) {
+                FixedOffset::west_opt(4 * 3600).unwrap()
+            } else {
+                FixedOffset::west_opt(5 * 3600).unwrap()
+            }
+        }
+    }
+
+    // Verify 23-hour spring-forward day and 25-hour fall-back day boundaries!
+    let s1 = history::local_day_start_sec(NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(), &MockDstTz)?;
+    let s2 = history::local_day_start_sec(NaiveDate::from_ymd_opt(2026, 3, 9).unwrap(), &MockDstTz)?;
+    assert_eq!(s2 - s1, 23 * 3600);
+
+    let f1 = history::local_day_start_sec(NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(), &MockDstTz)?;
+    let f2 = history::local_day_start_sec(NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(), &MockDstTz)?;
+    assert_eq!(f2 - f1, 25 * 3600);
+
+    // Event at 23:30 EST on the 25-hour day (24.5 hours after 00:00 EDT!) must STILL land in 2026-11-01!
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("monitor.sqlite"))?;
+    store.settings(false, || vec![agent("codex", "installed")])?;
+    store.select(vec!["codex".into()])?;
+    let late_25h_ts = f1 + 24 * 3600 + 1800; // 23:30 EST on 2026-11-01
+    store.connect()?.execute(
+        "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,legacy)
+         VALUES('codex','s1','dst1',?1,456,?2,1,0)",
+        rusqlite::params![late_25h_ts, late_25h_ts * 1_000_000_000],
+    )?;
+
+    let page = history::query_with_tz(
+        &store,
+        Granularity::Day,
+        0,
+        None,
+        None,
+        None,
+        NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
+        &MockDstTz,
+    )?;
+    assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-01").unwrap().verified_tokens, Some(456));
+    assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-02").unwrap().verified_tokens, None);
     Ok(())
 }

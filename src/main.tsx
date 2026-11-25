@@ -1,28 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { HistoryView, type TokenParts } from "./HistoryView";
 import "./style.css";
 
 type Agent = { id: string; name: string; status: string };
 type Settings = { agents: Agent[]; enabled: string[]; confirmed: boolean };
 type SourceStatus = "active" | "waiting";
-type TokenParts = {
-  input: number | null;
-  cache_read: number | null;
-  output: number | null;
-};
 type Usage = {
   today: number | null;
   today_complete_steps: number;
   today_incomplete_steps: number;
   today_incomplete_known: TokenParts | null;
   today_legacy_steps: number;
+  today_legacy_tokens: number | null;
   latest: number | null;
   latest_at: number | null;
   latest_at_ms: number | null;
   latest_incomplete: boolean;
   latest_parts: TokenParts | null;
   latest_legacy: boolean;
+  latest_legacy_tokens: number | null;
   status: SourceStatus;
 };
 type WindowData = {
@@ -38,6 +36,7 @@ type Quota = {
   checked_at: number;
 };
 type ThemeMode = "system" | "light" | "dark";
+type ViewMode = "overview" | "history" | "settings";
 type UsageReadState = "loading" | "active" | "waiting" | "error";
 type PendingAction = "idle" | "initial" | "rescan" | "save";
 
@@ -457,7 +456,8 @@ function UsagePanel({
                 className={
                   usage &&
                   usage.today == null &&
-                  usage.today_incomplete_steps > 0
+                  (usage.today_incomplete_steps > 0 ||
+                    usage.today_legacy_steps > 0)
                     ? "metric-incomplete"
                     : undefined
                 }
@@ -466,7 +466,9 @@ function UsagePanel({
                   ? usage.today.toLocaleString()
                   : usage && usage.today_incomplete_steps > 0
                     ? "用量不完整"
-                    : "—"}
+                    : usage && usage.today_legacy_steps > 0
+                      ? "仅含旧版记录"
+                      : "—"}
               </strong>
               {usage && usage.today_incomplete_steps > 0 && (
                 <span className="metric-hint">
@@ -475,12 +477,14 @@ function UsagePanel({
                     : `今日 ${usage.today_incomplete_steps} 步字段缺失`}
                   {usage.today_incomplete_known
                     ? `（已知 ${formatParts(usage.today_incomplete_known, false)}）`
-                    : ""}
+                    : "（分项全部未知）"}
                 </span>
               )}
               {usage && usage.today_legacy_steps > 0 && (
                 <span className="metric-hint">
-                  含 {usage.today_legacy_steps} 步旧版迁移记录（原日志已移除，无法核验缓存分项）
+                  旧版记录 {usage.today_legacy_steps} 步（旧版值{" "}
+                  {usage.today_legacy_tokens?.toLocaleString() ?? "—"}
+                  ，原日志已移除未核验，未计入完整合计）
                 </span>
               )}
             </div>
@@ -490,14 +494,18 @@ function UsagePanel({
               </small>
               <strong
                 className={
-                  usage?.latest_incomplete ? "metric-incomplete" : undefined
+                  usage?.latest_incomplete || usage?.latest_legacy
+                    ? "metric-incomplete"
+                    : undefined
                 }
               >
                 {usage?.latest_incomplete
                   ? "用量不完整"
-                  : usage?.latest != null
-                    ? usage.latest.toLocaleString()
-                    : "—"}
+                  : usage?.latest_legacy
+                    ? "仅含旧版记录"
+                    : usage?.latest != null
+                      ? usage.latest.toLocaleString()
+                      : "—"}
               </strong>
               {usage?.latest_incomplete && usage.latest_parts && (
                 <span className="metric-hint">
@@ -506,7 +514,8 @@ function UsagePanel({
               )}
               {!usage?.latest_incomplete && usage?.latest_legacy && (
                 <span className="metric-hint">
-                  旧版迁移记录（原日志已移除，时间精度为秒）
+                  旧版记录值 {usage.latest_legacy_tokens?.toLocaleString() ?? "—"}{" "}
+                  Token（原日志已移除，时间精度为秒）
                 </span>
               )}
             </div>
@@ -547,7 +556,7 @@ function UsagePanel({
 
 function App() {
   const [settings, setSettings] = useState<Settings | null>(null),
-    [editing, setEditing] = useState(false);
+    [view, setView] = useState<ViewMode>("overview");
   const [draft, setDraft] = useState<string[]>([]),
     [pending, setPending] = useState<PendingAction>("idle"),
     [error, setError] = useState("");
@@ -560,6 +569,7 @@ function App() {
     return saved === "light" || saved === "dark" ? saved : "system";
   });
 
+  const editing = view === "settings";
   const busy = pending !== "idle";
   const rescanning = pending === "rescan";
   const saving = pending === "save";
@@ -618,7 +628,7 @@ function App() {
         );
       setSettings(next);
       if (!rescan || !editing) setDraft(next.enabled);
-      if (rescan || !next.confirmed) setEditing(true);
+      if (rescan || !next.confirmed) setView("settings");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -636,7 +646,7 @@ function App() {
     try {
       const next = await invoke<Settings>("save_selection", { ids: draft });
       setSettings(next);
-      setEditing(false);
+      setView("overview");
       setNewIds([]);
     } catch (e) {
       setError(String(e));
@@ -681,9 +691,9 @@ function App() {
           <div className="segmented" role="tablist" aria-label="视图切换">
             <button
               disabled={!settings?.confirmed || busy}
-              aria-current={!editing ? "page" : undefined}
+              aria-current={view === "overview" ? "page" : undefined}
               onClick={() => {
-                setEditing(false);
+                setView("overview");
                 setError("");
               }}
             >
@@ -691,10 +701,20 @@ function App() {
             </button>
             <button
               disabled={!settings || busy}
-              aria-current={editing ? "page" : undefined}
+              aria-current={view === "history" ? "page" : undefined}
+              onClick={() => {
+                setView("history");
+                setError("");
+              }}
+            >
+              历史用量
+            </button>
+            <button
+              disabled={!settings || busy}
+              aria-current={view === "settings" ? "page" : undefined}
               onClick={() => {
                 setDraft(settings?.enabled ?? []);
-                setEditing(true);
+                setView("settings");
                 setError("");
               }}
             >
@@ -730,9 +750,15 @@ function App() {
         <div className="page-title">
           <div>
             <span className="eyebrow">本机工作区</span>
-            <h1>{editing ? "平台管理" : "用量总览"}</h1>
+            <h1>
+              {view === "settings"
+                ? "平台管理"
+                : view === "history"
+                  ? "历史用量"
+                  : "用量总览"}
+            </h1>
           </div>
-          {!editing && usageChosen.length > 0 && (
+          {view === "overview" && usageChosen.length > 0 && (
             activeCollectors.length > 0 ? (
               <span className="live-pill" data-live-state="active">
                 <span className="dot live pulse" aria-hidden="true" />
@@ -857,8 +883,12 @@ function App() {
           </section>
         )}
 
+        {settings && view === "history" && (
+          <HistoryView active={view === "history"} />
+        )}
+
         {settings?.confirmed && (
-          <div hidden={editing}>
+          <div hidden={view !== "overview"}>
             {chosen.some((a) => a.id === "codex") && <QuotaPanel />}
             {chosen.length > 0 ? (
               <>
@@ -884,7 +914,7 @@ function App() {
                   className="primary"
                   onClick={() => {
                     setDraft([]);
-                    setEditing(true);
+                    setView("settings");
                   }}
                 >
                   选择平台
