@@ -13,7 +13,9 @@ pub struct Settings {
     pub enabled: Vec<String>,
     pub confirmed: bool,
 }
-const CURRENT_SCHEMA_VERSION: i32 = 2;
+const CURRENT_SCHEMA_VERSION: i32 = 3;
+pub const ANTIGRAVITY_REPAIR_VERSION: i32 = 3;
+const ANTIGRAVITY_REPAIR_KEY: &str = "antigravity_repair_version";
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -23,6 +25,7 @@ impl Store {
             "PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS usage(
                 provider TEXT,
                 session TEXT,
@@ -35,6 +38,9 @@ impl Store {
                 cache_read_tokens INTEGER,
                 output_tokens INTEGER,
                 legacy INTEGER NOT NULL DEFAULT 0,
+                input_at_ns INTEGER,
+                cache_read_at_ns INTEGER,
+                output_at_ns INTEGER,
                 PRIMARY KEY(provider,session,response)
             );
             CREATE INDEX IF NOT EXISTS usage_date ON usage(provider,at);
@@ -45,6 +51,25 @@ impl Store {
     }
     pub fn connect(&self) -> Result<Connection> {
         Ok(Connection::open(&self.path)?)
+    }
+    pub fn antigravity_repair_pending(&self) -> Result<bool> {
+        let ver: Option<String> = self
+            .connect()?
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                [ANTIGRAVITY_REPAIR_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let parsed = ver.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+        Ok(parsed < ANTIGRAVITY_REPAIR_VERSION)
+    }
+    pub fn mark_antigravity_repaired(&self) -> Result<()> {
+        self.connect()?.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+            rusqlite::params![ANTIGRAVITY_REPAIR_KEY, ANTIGRAVITY_REPAIR_VERSION.to_string()],
+        )?;
+        Ok(())
     }
     pub fn settings(
         &self,
@@ -151,7 +176,6 @@ fn migrate_usage_schema(db: &mut Connection) -> Result<()> {
             existing.insert(col?);
         }
     }
-    let upgraded_from_legacy = !existing.contains("at_ns") || !existing.contains("complete");
     for (col, ddl) in [
         ("at_ns", "ALTER TABLE usage ADD COLUMN at_ns INTEGER"),
         (
@@ -174,20 +198,50 @@ fn migrate_usage_schema(db: &mut Connection) -> Result<()> {
             "legacy",
             "ALTER TABLE usage ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "input_at_ns",
+            "ALTER TABLE usage ADD COLUMN input_at_ns INTEGER",
+        ),
+        (
+            "cache_read_at_ns",
+            "ALTER TABLE usage ADD COLUMN cache_read_at_ns INTEGER",
+        ),
+        (
+            "output_at_ns",
+            "ALTER TABLE usage ADD COLUMN output_at_ns INTEGER",
+        ),
     ] {
         if !existing.contains(col) {
             tx.execute(ddl, [])?;
         }
     }
-    if upgraded_from_legacy {
-        // Only mark pre-existing Antigravity rows as legacy and reset Antigravity cursors so
-        // on-disk transcripts can backfill sub-second precision and cache completeness without
-        // touching Codex or Claude cursors/history.
+
+    // Detect pre-v3 databases (both v0 and v2 from 7d76bf1) that already hold Antigravity rows or cursors.
+    let has_antigravity_data: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage WHERE provider='antigravity')
+             OR EXISTS(SELECT 1 FROM cursors WHERE provider='antigravity')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_antigravity_data {
+        // Mark pre-v3 Antigravity rows as legacy and clear ONLY Antigravity cursors so on-disk
+        // transcripts are re-parsed atomically per file under v3 rules without touching Codex/Claude.
+        // `antigravity_repair_version=2` persists until every on-disk transcript finishes repairing,
+        // so crashes/restarts mid-repair resume cleanly from remaining files.
         tx.execute(
             "UPDATE usage SET legacy=1 WHERE provider='antigravity'",
             [],
         )?;
         tx.execute("DELETE FROM cursors WHERE provider='antigravity'", [])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+            rusqlite::params![ANTIGRAVITY_REPAIR_KEY, "2"],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+            rusqlite::params![ANTIGRAVITY_REPAIR_KEY, ANTIGRAVITY_REPAIR_VERSION.to_string()],
+        )?;
     }
     tx.execute_batch(&format!("PRAGMA user_version={CURRENT_SCHEMA_VERSION};"))?;
     tx.commit()?;

@@ -1,5 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+
+function localDateKey(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
 
 export type Granularity = "day" | "week" | "month";
 
@@ -539,47 +546,92 @@ export function HistoryView({ active }: { active: boolean }) {
   const [drillBucket, setDrillBucket] = useState<HistoryBucket | null>(null);
   const [drillPage, setDrillPage] = useState<HistoryPage | null>(null);
   const [drillLoading, setDrillLoading] = useState(false);
+  const [drillError, setDrillError] = useState("");
 
-  const loadHistory = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const data = await invoke<HistoryPage>("usage_history", {
-        granularity,
-        offset,
-        provider: provider === "all" ? null : provider,
-        rangeStart: null,
-        rangeEnd: null,
-      });
-      setPage(data);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [granularity, offset, provider]);
+  const mountedRef = useRef(true);
+  const mainReqRef = useRef(0);
+  const drillReqRef = useRef(0);
+  const mainKeyRef = useRef("");
+  const drillBucketRef = useRef<HistoryBucket | null>(null);
+  const drillBusyRef = useRef(false);
+  const drillErrorRef = useRef("");
+  const lastLocalDateRef = useRef(localDateKey());
 
   useEffect(() => {
-    if (!active) return;
-    void loadHistory();
-  }, [active, loadHistory]);
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      mainReqRef.current += 1;
+      drillReqRef.current += 1;
+    };
+  }, []);
 
-  // Clear drill-down whenever top-level granularity or page changes
-  useEffect(() => {
+  const closeDrill = useCallback(() => {
+    drillReqRef.current += 1;
+    drillBusyRef.current = false;
+    drillBucketRef.current = null;
+    drillErrorRef.current = "";
     setDrillBucket(null);
     setDrillPage(null);
-  }, [granularity, offset, provider]);
+    setDrillError("");
+    setDrillLoading(false);
+  }, []);
 
-  const openDrill = useCallback(
-    async (bucket: HistoryBucket) => {
-      if (granularity === "day") return;
-      if (drillBucket?.key === bucket.key) {
-        setDrillBucket(null);
-        setDrillPage(null);
-        return;
+  const fetchMain = useCallback(
+    async (silent: boolean) => {
+      const reqId = ++mainReqRef.current;
+      const queryKey = `${granularity}|${offset}|${provider}`;
+      if (!silent) {
+        setLoading(true);
+        setError("");
       }
-      setDrillBucket(bucket);
-      setDrillLoading(true);
+      try {
+        const data = await invoke<HistoryPage>("usage_history", {
+          granularity,
+          offset,
+          provider: provider === "all" ? null : provider,
+          rangeStart: null,
+          rangeEnd: null,
+        });
+        if (!mountedRef.current || reqId !== mainReqRef.current) return;
+        mainKeyRef.current = queryKey;
+        setPage(data);
+        setError("");
+        const openKey = drillBucketRef.current?.key;
+        if (openKey) {
+          const updated = data.buckets.find((b) => b.key === openKey);
+          if (updated) {
+            drillBucketRef.current = updated;
+            setDrillBucket(updated);
+          }
+        }
+      } catch (e) {
+        if (!mountedRef.current || reqId !== mainReqRef.current) return;
+        setError(String(e));
+        if (!silent && mainKeyRef.current !== queryKey) {
+          setPage(null);
+        }
+      } finally {
+        if (mountedRef.current && reqId === mainReqRef.current) {
+          setLoading(false);
+        }
+      }
+    },
+    [granularity, offset, provider],
+  );
+
+  const fetchDrill = useCallback(
+    async (bucket: HistoryBucket, silent: boolean) => {
+      const reqId = ++drillReqRef.current;
+      if (!silent) {
+        drillBusyRef.current = true;
+        drillBucketRef.current = bucket;
+        drillErrorRef.current = "";
+        setDrillBucket(bucket);
+        setDrillPage(null);
+        setDrillError("");
+        setDrillLoading(true);
+      }
       try {
         const data = await invoke<HistoryPage>("usage_history", {
           granularity: "day",
@@ -588,14 +640,149 @@ export function HistoryView({ active }: { active: boolean }) {
           rangeStart: bucket.start_date,
           rangeEnd: bucket.end_date,
         });
+        if (!mountedRef.current || reqId !== drillReqRef.current) return;
+        drillErrorRef.current = "";
         setDrillPage(data);
+        setDrillError("");
       } catch (e) {
-        setError(String(e));
+        if (!mountedRef.current || reqId !== drillReqRef.current) return;
+        if (!silent) {
+          setDrillPage(null);
+        }
+        drillErrorRef.current = String(e);
+        setDrillError(String(e));
       } finally {
-        setDrillLoading(false);
+        if (mountedRef.current && reqId === drillReqRef.current) {
+          setDrillLoading(false);
+          drillBusyRef.current = false;
+        }
       }
     },
-    [drillBucket?.key, granularity, provider],
+    [provider],
+  );
+
+  // Synchronized silent refresh for parent list + open daily drill-down (and local midnight rollover).
+  const refreshVisible = useCallback(async () => {
+    const queryKey = `${granularity}|${offset}|${provider}`;
+    const mainReqId = ++mainReqRef.current;
+    const activeDrill =
+      !drillBusyRef.current && !drillErrorRef.current
+        ? drillBucketRef.current
+        : null;
+    const drillReqId = activeDrill ? ++drillReqRef.current : null;
+
+    const mainPromise = invoke<HistoryPage>("usage_history", {
+      granularity,
+      offset,
+      provider: provider === "all" ? null : provider,
+      rangeStart: null,
+      rangeEnd: null,
+    }).then(
+      (data) => ({ ok: true as const, data }),
+      (err) => ({ ok: false as const, err }),
+    );
+
+    const drillPromise = activeDrill
+      ? invoke<HistoryPage>("usage_history", {
+          granularity: "day",
+          offset: 0,
+          provider: provider === "all" ? null : provider,
+          rangeStart: activeDrill.start_date,
+          rangeEnd: activeDrill.end_date,
+        }).then(
+          (data) => ({ ok: true as const, data }),
+          (err) => ({ ok: false as const, err }),
+        )
+      : Promise.resolve(null);
+
+    const [mainRes, drillRes] = await Promise.all([mainPromise, drillPromise]);
+    if (!mountedRef.current) return;
+
+    if (mainReqId === mainReqRef.current) {
+      if (mainRes.ok) {
+        mainKeyRef.current = queryKey;
+        setPage(mainRes.data);
+        setError("");
+        const openKey = drillBucketRef.current?.key;
+        if (openKey) {
+          const updated = mainRes.data.buckets.find((b) => b.key === openKey);
+          if (updated) {
+            drillBucketRef.current = updated;
+            setDrillBucket(updated);
+          }
+        }
+      } else {
+        setError(String(mainRes.err));
+      }
+    }
+
+    if (
+      activeDrill &&
+      drillRes &&
+      drillReqId != null &&
+      drillReqId === drillReqRef.current
+    ) {
+      if (drillRes.ok) {
+        setDrillPage(drillRes.data);
+        setDrillError("");
+      } else {
+        setDrillError(String(drillRes.err));
+      }
+    }
+  }, [granularity, offset, provider]);
+
+  // Initial load & reset drill-down whenever granularity, offset, or provider changes.
+  useEffect(() => {
+    closeDrill();
+    if (!active) return;
+    lastLocalDateRef.current = localDateKey();
+    void fetchMain(false);
+  }, [active, granularity, offset, provider, closeDrill, fetchMain]);
+
+  // Periodic read-only SQLite refresh + immediate midnight rollover detection while History is active.
+  useEffect(() => {
+    if (!active) return;
+    let inFlight = false;
+    const tick = async () => {
+      const todayKey = localDateKey();
+      const crossedMidnight = todayKey !== lastLocalDateRef.current;
+      if (crossedMidnight) {
+        lastLocalDateRef.current = todayKey;
+      }
+      if (document.visibilityState !== "visible" && !crossedMidnight) return;
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        await refreshVisible();
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = window.setInterval(() => {
+      void tick();
+    }, 1500);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void tick();
+    };
+    window.addEventListener("focus", onVisible);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onVisible);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [active, refreshVisible]);
+
+  const openDrill = useCallback(
+    async (bucket: HistoryBucket) => {
+      if (granularity === "day") return;
+      if (drillBucketRef.current?.key === bucket.key) {
+        closeDrill();
+        return;
+      }
+      await fetchDrill(bucket, false);
+    },
+    [granularity, closeDrill, fetchDrill],
   );
 
   const summary = page?.summary;
@@ -705,7 +892,7 @@ export function HistoryView({ active }: { active: boolean }) {
           <span>{error}</span>
           <button
             className="btn-secondary btn-sm"
-            onClick={() => void loadHistory()}
+            onClick={() => void fetchMain(false)}
           >
             重试
           </button>
@@ -816,7 +1003,7 @@ export function HistoryView({ active }: { active: boolean }) {
       )}
 
       {drillBucket && (
-        <section className="panel drill-panel">
+        <section className="panel drill-panel" data-drill-key={drillBucket.key}>
           <div className="section-head">
             <div>
               <span className="eyebrow">周期每日明细</span>
@@ -836,14 +1023,24 @@ export function HistoryView({ active }: { active: boolean }) {
             <button
               type="button"
               className="btn-ghost btn-sm"
-              onClick={() => {
-                setDrillBucket(null);
-                setDrillPage(null);
-              }}
+              onClick={closeDrill}
             >
               收起每日明细
             </button>
           </div>
+
+          {drillError && (
+            <p role="alert" className="notice drill-notice">
+              <span>{drillError}</span>
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                onClick={() => void fetchDrill(drillBucket, false)}
+              >
+                重试
+              </button>
+            </p>
+          )}
 
           {drillLoading ? (
             <p className="muted">正在读取每日明细…</p>

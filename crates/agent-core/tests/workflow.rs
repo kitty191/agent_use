@@ -921,12 +921,13 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
         }
     }
 
-    // Open with new Store -> upgrades schema to v2, resets ONLY Antigravity cursors.
+    // Open with new Store -> upgrades schema to v3, resets ONLY Antigravity cursors.
     let store = Store::open(&db_path)?;
     {
         let con = store.connect()?;
         let ver: i32 = con.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        assert_eq!(ver, 2);
+        assert_eq!(ver, 3);
+        assert!(store.antigravity_repair_pending()?);
         let codex_cursor_fp: String = con.query_row(
             "SELECT fingerprint FROM cursors WHERE provider='codex'",
             [],
@@ -947,6 +948,7 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
     // - conv-deleted is preserved SEPARATELY as legacy history (777 tokens, today_legacy_steps = 1)
     // - verified complete today sum = 100 + 200 = 300 (legacy 777 is NOT mixed into verified sum!)
     let u_after = Monitor::default().update(&store, "antigravity", &brain)?;
+    assert!(!store.antigravity_repair_pending()?);
     assert_eq!(u_after.latest, Some(200));
     assert_eq!(u_after.today, Some(300));
     assert_eq!(u_after.today_complete_steps, 2);
@@ -1352,5 +1354,314 @@ fn history_dst_23h_and_25h_days_do_not_assume_86400_seconds() -> anyhow::Result<
     )?;
     assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-01").unwrap().verified_tokens, Some(456));
     assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-02").unwrap().verified_tokens, None);
+    Ok(())
+}
+
+#[test]
+fn antigravity_out_of_order_field_merge_and_restart_persistence() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+
+    // Sequence 1: Nov 27 complete 300 -> Nov 29 complete 500 -> replay Nov 28 complete 400.
+    // Final: 1 step, 500 tokens attributed to Nov 27; replaying again yields identical state.
+    {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("seq1.sqlite");
+        let store = Store::open(&db_path)?;
+        store.settings(false, || vec![agent("antigravity", "installed")])?;
+        store.select(vec!["antigravity".into()])?;
+
+        let brain = dir.path().join("brain");
+        let logs = brain.join("conv-seq1/.system_generated/logs");
+        fs::create_dir_all(&logs)?;
+        let transcript = logs.join("transcript.jsonl");
+        let mut f = fs::File::create(&transcript)?;
+
+        let e27 = json!({
+            "step_index": 7, "type": "PLANNER_RESPONSE", "status": "DONE",
+            "created_at": "2026-11-27T10:00:00+08:00",
+            "input_tokens": 200, "cache_read_tokens": 50, "output_tokens": 50
+        });
+        let e29 = json!({
+            "step_index": 7, "type": "PLANNER_RESPONSE", "status": "DONE",
+            "created_at": "2026-11-29T10:00:00+08:00",
+            "input_tokens": 350, "cache_read_tokens": 100, "output_tokens": 50
+        });
+        let e28 = json!({
+            "step_index": 7, "type": "PLANNER_RESPONSE", "status": "DONE",
+            "created_at": "2026-11-28T10:00:00+08:00",
+            "input_tokens": 250, "cache_read_tokens": 100, "output_tokens": 50
+        });
+
+        writeln!(f, "{e27}")?;
+        writeln!(f, "{e29}")?;
+        writeln!(f, "{e28}")?;
+        f.flush()?;
+
+        let mut mon = Monitor::default();
+        mon.update(&store, "antigravity", &brain)?;
+
+        // Replay Nov 28 again
+        writeln!(f, "{e28}")?;
+        f.flush()?;
+        mon.update(&store, "antigravity", &brain)?;
+
+        let count: i64 = store.connect()?.query_row(
+            "SELECT COUNT(*) FROM usage WHERE provider='antigravity'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 1);
+
+        let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+        assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-27").unwrap().verified_tokens, Some(500));
+        assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap().verified_tokens, None);
+        assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap().verified_tokens, None);
+    }
+
+    // Sequence 2: Dec 1 complete 420 -> restart -> Nov 29 earlier partial record.
+    // Final: keeps complete 420, attributed to Nov 29; Dec 1 no longer has this step.
+    {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("seq2.sqlite");
+        let brain = dir.path().join("brain");
+        let logs = brain.join("conv-seq2/.system_generated/logs");
+        fs::create_dir_all(&logs)?;
+        let transcript = logs.join("transcript.jsonl");
+
+        {
+            let store = Store::open(&db_path)?;
+            store.settings(false, || vec![agent("antigravity", "installed")])?;
+            store.select(vec!["antigravity".into()])?;
+            fs::write(
+                &transcript,
+                format!(
+                    "{}\n",
+                    json!({
+                        "step_index": 9, "type": "PLANNER_RESPONSE", "status": "DONE",
+                        "created_at": "2026-12-01T10:00:00+08:00",
+                        "input_tokens": 300, "cache_read_tokens": 100, "output_tokens": 20
+                    })
+                ),
+            )?;
+            Monitor::default().update(&store, "antigravity", &brain)?;
+        }
+
+        // Restart Store & Monitor, then append earlier Nov 29 partial record
+        let store = Store::open(&db_path)?;
+        let mut f = fs::OpenOptions::new().append(true).open(&transcript)?;
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "step_index": 9, "type": "PLANNER_RESPONSE", "status": "DONE",
+                "created_at": "2026-11-29T10:00:00+08:00",
+                "input_tokens": 280, "output_tokens": 15
+            })
+        )?;
+        f.flush()?;
+        Monitor::default().update(&store, "antigravity", &brain)?;
+
+        let count: i64 = store.connect()?.query_row(
+            "SELECT COUNT(*) FROM usage WHERE provider='antigravity'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 1);
+
+        let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let day_page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+        assert_eq!(day_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap().verified_tokens, Some(420));
+        assert_eq!(day_page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap().verified_tokens, None);
+
+        let month_page = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
+        assert_eq!(month_page.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens, Some(420));
+        assert_eq!(month_page.buckets.iter().find(|b| b.key == "2026-12").unwrap().verified_tokens, None);
+    }
+
+    // Explicit 0 is a valid newer value and must not be overwritten by later missing field.
+    {
+        let dir = tempdir()?;
+        let store = Store::open(&dir.path().join("zero.sqlite"))?;
+        store.settings(false, || vec![agent("antigravity", "installed")])?;
+        store.select(vec!["antigravity".into()])?;
+        let brain = dir.path().join("brain");
+        let logs = brain.join("conv-zero/.system_generated/logs");
+        fs::create_dir_all(&logs)?;
+        fs::write(
+            logs.join("transcript.jsonl"),
+            [
+                json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T09:00:00+08:00", "input_tokens": 300, "output_tokens": 20}),
+                json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-30T09:00:00+08:00", "cache_read_tokens": 0}),
+                json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-01T09:00:00+08:00", "input_tokens": 310}),
+            ]
+            .map(|v| v.to_string())
+            .join("\n")
+                + "\n",
+        )?;
+        Monitor::default().update(&store, "antigravity", &brain)?;
+        let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+        assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap().verified_tokens, Some(330));
+        assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-30").unwrap().verified_tokens, None);
+        assert_eq!(page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap().verified_tokens, None);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn v2_upgrade_repairs_antigravity_and_resumes_after_interruption() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dir = tempdir()?;
+    let db_v2 = dir.path().join("from_v2.sqlite");
+    let db_fresh = dir.path().join("fresh_v3.sqlite");
+    let brain = dir.path().join("brain");
+    let codex_root = dir.path().join("codex-sessions");
+    fs::create_dir_all(&codex_root)?;
+
+    let logs1 = brain.join("conv-main/.system_generated/logs");
+    let logs2 = brain.join("conv-second/.system_generated/logs");
+    fs::create_dir_all(&logs1)?;
+    fs::create_dir_all(&logs2)?;
+    let t1 = logs1.join("transcript.jsonl");
+    let t2 = logs2.join("transcript.jsonl");
+
+    // conv-main: Step A (DONE, all 3 fields missing) + Step B (Nov 29 in=300, out=20; Dec 1 cache_read=100)
+    fs::write(
+        &t1,
+        [
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T09:00:00+08:00"}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T10:00:00+08:00", "input_tokens": 300, "output_tokens": 20}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-01T10:00:00+08:00", "cache_read_tokens": 100}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n")
+            + "\n",
+    )?;
+    fs::write(
+        &t2,
+        format!(
+            "{}\n",
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-30T11:00:00+08:00", "input_tokens": 100, "cache_read_tokens": 50, "output_tokens": 25})
+        ),
+    )?;
+
+    // Build a v2 database matching 7d76bf1's schema & EOF state (Step A skipped, Step B overwritten with Dec 1 partial 100).
+    {
+        let con = rusqlite::Connection::open(&db_v2)?;
+        con.execute_batch(
+            "PRAGMA user_version=2;
+             CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE usage(provider TEXT, session TEXT, response TEXT, at INTEGER NOT NULL, tokens INTEGER NOT NULL, at_ns INTEGER, complete INTEGER NOT NULL DEFAULT 1, input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER, legacy INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(provider,session,response));
+             CREATE INDEX usage_date ON usage(provider,at);
+             CREATE TABLE cursors(provider TEXT, path TEXT, fingerprint TEXT, pos INTEGER NOT NULL, PRIMARY KEY(provider,path));",
+        )?;
+        let settings = json!({
+            "agents": [
+                {"id": "codex", "name": "OpenAI Codex", "status": "installed", "binary": null},
+                {"id": "antigravity", "name": "Antigravity", "status": "installed", "binary": null}
+            ],
+            "enabled": ["codex", "antigravity"],
+            "confirmed": true
+        });
+        con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
+        let dec1 = chrono::DateTime::parse_from_rfc3339("2026-12-01T10:00:00+08:00")?;
+        let nov28 = chrono::DateTime::parse_from_rfc3339("2026-11-28T10:00:00+08:00")?;
+        let nov29 = chrono::DateTime::parse_from_rfc3339("2026-11-29T08:00:00+08:00")?;
+        // 7d76bf1 skipped Step A, left Step B as Dec 1 partial 100, and had a deleted-log row (777) + Codex row (5000).
+        con.execute(
+            "INSERT INTO usage VALUES('antigravity','conv-main','2',?1,100,?2,0,NULL,100,NULL,0)",
+            rusqlite::params![dec1.timestamp(), dec1.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO usage VALUES('antigravity','conv-deleted','1',?1,777,?2,1,700,50,27,0)",
+            rusqlite::params![nov28.timestamp(), nov28.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO usage VALUES('codex','s1','r1',?1,5000,?2,1,NULL,NULL,NULL,0)",
+            rusqlite::params![nov29.timestamp(), nov29.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO cursors VALUES('codex', '/fake/codex.jsonl', 'codex-fp', 160)",
+            [],
+        )?;
+        con.execute(
+            "INSERT INTO cursors VALUES('antigravity', ?1, 'old-fp', ?2)",
+            rusqlite::params![t1.to_string_lossy(), t1.metadata()?.len() as i64],
+        )?;
+        con.execute(
+            "INSERT INTO cursors VALUES('antigravity', ?1, 'old-fp2', ?2)",
+            rusqlite::params![t2.to_string_lossy(), t2.metadata()?.len() as i64],
+        )?;
+    }
+
+    // Open with new Store (v3 migration runs) and simulate interruption: hide conv-second during first repair pass,
+    // wait — simulate real mid-repair failure by making conv-second temporarily unreadable on unix (or checking pending state).
+    let store = Store::open(&db_v2)?;
+    assert!(store.antigravity_repair_pending()?);
+
+    // Simulate interruption: first repair pass only sees conv-main (rename conv-second away temporarily and force pending back),
+    // verify conv-main gets EOF cursor & repaired rows, then restore conv-second while repair is still pending and resume!
+    let t2_backup = dir.path().join("conv-second-backup");
+    fs::rename(brain.join("conv-second"), &t2_backup)?;
+    Monitor::default().update(&store, "antigravity", &brain)?;
+    // Simulate crash right before mark_antigravity_repaired committed while conv-main was already committed at EOF:
+    store.connect()?.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('antigravity_repair_version','2')",
+        [],
+    )?;
+    fs::rename(&t2_backup, brain.join("conv-second"))?;
+
+    // Reopen Store & Monitor: resumes repair, skips already-repaired conv-main, repairs conv-second, marks v3 done!
+    let store = Store::open(&db_v2)?;
+    assert!(store.antigravity_repair_pending()?);
+    Monitor::default().update(&store, "antigravity", &brain)?;
+    assert!(!store.antigravity_repair_pending()?);
+
+    // Build a fresh v3 DB from the exact same on-disk transcripts for field-by-field comparison.
+    let fresh = Store::open(&db_fresh)?;
+    fresh.settings(false, || vec![agent("antigravity", "installed")])?;
+    fresh.select(vec!["antigravity".into()])?;
+    Monitor::default().update(&fresh, "antigravity", &brain)?;
+
+    type RowDump = (String, String, i64, Option<i64>, i64, i64, Option<i64>, Option<i64>, Option<i64>, i64);
+    let dump = |s: &Store| -> anyhow::Result<Vec<RowDump>> {
+        let con = s.connect()?;
+        let mut stmt = con.prepare(
+            "SELECT session, response, at, at_ns, tokens, complete, input_tokens, cache_read_tokens, output_tokens, legacy
+             FROM usage WHERE provider='antigravity' AND session != 'conv-deleted' ORDER BY session, response",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+    assert_eq!(dump(&store)?, dump(&fresh)?);
+
+    // Reopen twice more: zero duplication, repair stays done, Codex untouched, conv-deleted preserved as legacy.
+    for _ in 0..2 {
+        let s = Store::open(&db_v2)?;
+        assert!(!s.antigravity_repair_pending()?);
+        Monitor::default().update(&s, "antigravity", &brain)?;
+        assert_eq!(dump(&s)?, dump(&fresh)?);
+    }
+
+    let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let day_page = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
+    let b28 = day_page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap();
+    assert_eq!((b28.verified_tokens, b28.legacy_steps, b28.legacy_tokens), (None, 1, Some(777)));
+    let b29 = day_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap();
+    assert_eq!((b29.verified_tokens, b29.verified_steps, b29.incomplete_steps, b29.incomplete_known.clone()), (Some(420), 1, 1, None));
+    let b30 = day_page.buckets.iter().find(|b| b.key == "2026-11-30").unwrap();
+    assert_eq!(b30.verified_tokens, Some(175));
+    let b01 = day_page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap();
+    assert_eq!((b01.verified_tokens, b01.incomplete_steps), (None, 0));
+
+    let codex_fp: String = store.connect()?.query_row("SELECT fingerprint FROM cursors WHERE provider='codex'", [], |r| r.get(0))?;
+    assert_eq!(codex_fp, "codex-fp");
     Ok(())
 }

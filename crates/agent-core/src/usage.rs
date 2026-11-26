@@ -161,6 +161,12 @@ impl Monitor {
             }
         }
         let mut pending = std::mem::take(&mut *self.changes.lock().unwrap());
+        let repairing_antigravity = id == "antigravity" && store.antigravity_repair_pending()?;
+        if repairing_antigravity {
+            // Force a complete check of all on-disk Antigravity transcripts; files already
+            // repaired before an interruption have EOF cursors and are skipped cleanly.
+            pending.all = true;
+        }
         if id == "codex" {
             // A new rollout is not in the hot-file set yet. Directory mtime changes
             // on creation/rename even if the OS coalesces or drops the file event.
@@ -204,6 +210,9 @@ impl Monitor {
             self.antigravity_transcripts = current;
         }
         self.sync(store, id, root, pending, reconcile)?;
+        if repairing_antigravity {
+            store.mark_antigravity_repaired()?;
+        }
         totals(store, id, SourceStatus::Active)
     }
 
@@ -518,10 +527,41 @@ fn import(
     Ok(())
 }
 
+fn merge_field(
+    ex_val: Option<i64>,
+    ex_ts: Option<i64>,
+    inc_val: Option<i64>,
+    inc_ts: i64,
+) -> (Option<i64>, Option<i64>) {
+    match (ex_val, inc_val) {
+        (_, None) => (ex_val, ex_ts),
+        (None, Some(v)) => (Some(v), Some(inc_ts)),
+        (Some(ev), Some(iv)) => {
+            if ex_ts.is_none_or(|ts| inc_ts >= ts) {
+                (Some(iv), Some(inc_ts))
+            } else {
+                (Some(ev), ex_ts)
+            }
+        }
+    }
+}
+
 fn upsert_antigravity_record(tx: &rusqlite::Transaction<'_>, rec: &ParsedRecord) -> Result<()> {
-    let existing: Option<(i64, Option<i64>, i64, i64, Option<i64>, Option<i64>, Option<i64>, i64)> =
-        tx.query_row(
-            "SELECT at, at_ns, tokens, complete, input_tokens, cache_read_tokens, output_tokens, legacy
+    type ExistingRow = (
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let existing: Option<ExistingRow> = tx
+        .query_row(
+            "SELECT at, at_ns, input_tokens, cache_read_tokens, output_tokens, legacy,
+                    input_at_ns, cache_read_at_ns, output_at_ns
              FROM usage
              WHERE provider='antigravity' AND session=?1 AND response=?2",
             params![rec.session, rec.response],
@@ -535,92 +575,68 @@ fn upsert_antigravity_record(tx: &rusqlite::Transaction<'_>, rec: &ParsedRecord)
                     r.get(5)?,
                     r.get(6)?,
                     r.get(7)?,
+                    r.get(8)?,
                 ))
             },
         )
         .optional()?;
 
-    let (at, at_ns, tokens, complete, input, cache_read, output) = match existing {
-        None => (
-            rec.at,
-            rec.at_ns,
-            rec.tokens,
-            rec.complete,
-            rec.input,
-            rec.cache_read,
-            rec.output,
-        ),
-        Some((_, _, _, _, _, _, _, 1)) => {
-            // Legacy pre-upgrade row being backfilled from the on-disk transcript: replace cleanly.
+    let (at, at_ns, input, in_ts, cache_read, cr_ts, output, out_ts) = match existing {
+        None | Some((_, _, _, _, _, 1, _, _, _)) => {
+            // New row or legacy pre-v3 row being repaired from on-disk transcript: initialize cleanly.
             (
                 rec.at,
                 rec.at_ns,
-                rec.tokens,
-                rec.complete,
                 rec.input,
+                rec.input.map(|_| rec.at_ns),
                 rec.cache_read,
+                rec.cache_read.map(|_| rec.at_ns),
                 rec.output,
+                rec.output.map(|_| rec.at_ns),
             )
         }
-        Some((ex_at, ex_at_ns, _ex_tokens, ex_complete, ex_in, ex_cr, ex_out, _)) => {
+        Some((ex_at, ex_at_ns, ex_in, ex_cr, ex_out, _, ex_in_ts, ex_cr_ts, ex_out_ts)) => {
             let ex_ns = ex_at_ns.unwrap_or(ex_at.saturating_mul(1_000_000_000));
-            if ex_complete == 1 {
-                // Never downgrade a confirmed complete step with an incomplete replay.
-                if !rec.complete {
-                    return Ok(());
-                }
-                if rec.at_ns < ex_ns {
-                    return Ok(());
-                }
-                // Preserve the earliest observed step timestamp so delayed updates stay in the original day/week/month.
-                let (keep_at, keep_ns) = if rec.at_ns < ex_ns {
-                    (rec.at, rec.at_ns)
-                } else {
-                    (ex_at, ex_ns)
-                };
-                (
-                    keep_at,
-                    keep_ns,
-                    rec.tokens,
-                    true,
-                    rec.input,
-                    rec.cache_read,
-                    rec.output,
-                )
+            // Attribution timestamp is always the earliest valid source timestamp observed for this step.
+            let (keep_at, keep_ns) = if rec.at_ns < ex_ns {
+                (rec.at, rec.at_ns)
             } else {
-                // Field-level merge across partial backfills of the same step.
-                let (m_in, m_cr, m_out) = if rec.at_ns >= ex_ns {
-                    (
-                        rec.input.or(ex_in),
-                        rec.cache_read.or(ex_cr),
-                        rec.output.or(ex_out),
-                    )
-                } else {
-                    (
-                        ex_in.or(rec.input),
-                        ex_cr.or(rec.cache_read),
-                        ex_out.or(rec.output),
-                    )
-                };
-                let complete = m_in.is_some() && m_cr.is_some() && m_out.is_some();
-                let tokens = m_in
-                    .unwrap_or(0)
-                    .saturating_add(m_cr.unwrap_or(0))
-                    .saturating_add(m_out.unwrap_or(0));
-                // Keep earliest source timestamp so a later backfill (e.g. Dec 1) stays in the step's original period (e.g. Nov 29).
-                let (keep_at, keep_ns) = if rec.at_ns < ex_ns {
-                    (rec.at, rec.at_ns)
-                } else {
-                    (ex_at, ex_ns)
-                };
-                (keep_at, keep_ns, tokens, complete, m_in, m_cr, m_out)
-            }
+                (ex_at, ex_ns)
+            };
+            // Each token field independently adopts the value with the latest valid source timestamp.
+            let (m_in, m_in_ts) =
+                merge_field(ex_in, ex_in_ts.or_else(|| ex_in.map(|_| ex_ns)), rec.input, rec.at_ns);
+            let (m_cr, m_cr_ts) = merge_field(
+                ex_cr,
+                ex_cr_ts.or_else(|| ex_cr.map(|_| ex_ns)),
+                rec.cache_read,
+                rec.at_ns,
+            );
+            let (m_out, m_out_ts) = merge_field(
+                ex_out,
+                ex_out_ts.or_else(|| ex_out.map(|_| ex_ns)),
+                rec.output,
+                rec.at_ns,
+            );
+            (
+                keep_at, keep_ns, m_in, m_in_ts, m_cr, m_cr_ts, m_out, m_out_ts,
+            )
         }
     };
 
+    let complete = input.is_some() && cache_read.is_some() && output.is_some();
+    let tokens = input
+        .unwrap_or(0)
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(output.unwrap_or(0));
+
     tx.execute(
-        "INSERT OR REPLACE INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
-         VALUES('antigravity',?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",
+        "INSERT OR REPLACE INTO usage(
+            provider,session,response,at,tokens,at_ns,complete,
+            input_tokens,cache_read_tokens,output_tokens,legacy,
+            input_at_ns,cache_read_at_ns,output_at_ns
+         )
+         VALUES('antigravity',?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11,?12)",
         params![
             rec.session,
             rec.response,
@@ -631,6 +647,9 @@ fn upsert_antigravity_record(tx: &rusqlite::Transaction<'_>, rec: &ParsedRecord)
             input,
             cache_read,
             output,
+            in_ts,
+            cr_ts,
+            out_ts,
         ],
     )?;
     Ok(())
