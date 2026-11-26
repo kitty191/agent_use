@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{BufRead, BufReader, ErrorKind, Seek, SeekFrom},
+    io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
@@ -161,11 +161,8 @@ impl Monitor {
             }
         }
         let mut pending = std::mem::take(&mut *self.changes.lock().unwrap());
-        let repairing_antigravity = id == "antigravity" && store.antigravity_repair_pending()?;
-        if repairing_antigravity {
-            // Force a complete check of all on-disk Antigravity transcripts; files already
-            // repaired before an interruption have EOF cursors and are skipped cleanly.
-            pending.all = true;
+        if id == "antigravity" && store.antigravity_repair_pending()? {
+            repair_antigravity_history(store, root)?;
         }
         if id == "codex" {
             // A new rollout is not in the hot-file set yet. Directory mtime changes
@@ -210,9 +207,6 @@ impl Monitor {
             self.antigravity_transcripts = current;
         }
         self.sync(store, id, root, pending, reconcile)?;
-        if repairing_antigravity {
-            store.mark_antigravity_repaired()?;
-        }
         totals(store, id, SourceStatus::Active)
     }
 
@@ -470,6 +464,360 @@ fn antigravity_conversation_id(base_root: &Path, path: &Path) -> Option<String> 
     } else {
         None
     }
+}
+
+fn antigravity_conversation_id_from_path(base_root: &Path, path: &Path) -> Option<String> {
+    if let Some(id) = antigravity_conversation_id(base_root, path) {
+        return Some(id);
+    }
+    let comps: Vec<_> = path.components().collect();
+    if comps.len() < 4 {
+        return None;
+    }
+    let tail = &comps[comps.len() - 4..];
+    let [Component::Normal(conv), Component::Normal(sys), Component::Normal(logs), Component::Normal(file)] =
+        tail
+    else {
+        return None;
+    };
+    if *sys == ".system_generated" && *logs == "logs" && *file == "transcript.jsonl" {
+        Some(conv.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyV2Row {
+    at: i64,
+    at_ns: i64,
+    tokens: i64,
+    complete: i64,
+    input: Option<i64>,
+    cache_read: Option<i64>,
+    output: Option<i64>,
+}
+
+fn antigravity_v2_step_from_event(event: &Value) -> Option<(String, LegacyV2Row)> {
+    if event["type"].as_str()? != "PLANNER_RESPONSE" || event["status"].as_str()? != "DONE" {
+        return None;
+    }
+    let (at, at_ns) = parse_rfc3339(event["created_at"].as_str()?)?;
+    let step = event["step_index"].as_i64().filter(|&n| n >= 0)?;
+    let input = optional_nonneg_i64(event, "input_tokens").ok()?;
+    let cache_read = optional_nonneg_i64(event, "cache_read_tokens").ok()?;
+    let output = optional_nonneg_i64(event, "output_tokens").ok()?;
+    if input.is_none() && cache_read.is_none() && output.is_none() {
+        return None;
+    }
+    let complete = i64::from(input.is_some() && cache_read.is_some() && output.is_some());
+    let tokens = input
+        .unwrap_or(0)
+        .checked_add(cache_read.unwrap_or(0))?
+        .checked_add(output.unwrap_or(0))?;
+    Some((
+        step.to_string(),
+        LegacyV2Row {
+            at,
+            at_ns,
+            tokens,
+            complete,
+            input,
+            cache_read,
+            output,
+        },
+    ))
+}
+
+fn upsert_v2_sim(sim: &mut BTreeMap<String, LegacyV2Row>, response: String, row: LegacyV2Row) {
+    match sim.get(&response) {
+        None => {
+            sim.insert(response, row);
+        }
+        Some(old) => {
+            let should_replace = row.complete > old.complete
+                || (row.complete == old.complete && row.at_ns >= old.at_ns);
+            if should_replace {
+                sim.insert(response, row);
+            }
+        }
+    }
+}
+
+/// One-shot resumable history repair for Antigravity, decoupled from `Monitor::update` so
+/// platforms disabled before upgrading still repair only their previously collected log scope
+/// without reading post-disable appends or new conversations, and without modifying settings.
+pub fn repair_antigravity_history(store: &Store, root: &Path) -> Result<()> {
+    if !store.antigravity_repair_pending()? {
+        return Ok(());
+    }
+    let mut db = store.connect()?;
+    let mut tasks: Vec<(String, String, Option<String>, Option<i64>)> = Vec::new();
+    {
+        let mut stmt = db.prepare(
+            "SELECT kind, target, fingerprint, max_pos
+             FROM antigravity_repair_tasks
+             WHERE done=0
+             ORDER BY kind, target",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        for row in rows {
+            tasks.push(row?);
+        }
+    }
+
+    for (kind, target, fingerprint, max_pos) in tasks {
+        match kind.as_str() {
+            "cursor" => {
+                repair_cursor_task(
+                    &mut db,
+                    root,
+                    &target,
+                    fingerprint.as_deref().unwrap_or(""),
+                    max_pos.unwrap_or(0),
+                )?;
+            }
+            "session" => {
+                repair_session_task(&mut db, root, &target)?;
+            }
+            _ => {
+                db.execute(
+                    "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+                    [&target],
+                )?;
+            }
+        }
+    }
+
+    store.mark_antigravity_repaired()?;
+    Ok(())
+}
+
+fn repair_cursor_task(
+    db: &mut rusqlite::Connection,
+    root: &Path,
+    target: &str,
+    expected_fp: &str,
+    raw_max_pos: i64,
+) -> Result<()> {
+    let max_pos = match u64::try_from(raw_max_pos) {
+        Ok(p) => p,
+        Err(_) => {
+            db.execute(
+                "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+                [target],
+            )?;
+            return Ok(());
+        }
+    };
+    let path = Path::new(target);
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // Source file deleted: preserve existing DB rows as legacy unverified and finish task.
+            db.execute(
+                "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+                [target],
+            )?;
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("修复历史时无法访问日志文件 {}", path.display()))
+        }
+    };
+    if expected_fp.is_empty() || file_id(&meta) != expected_fp || meta.len() < max_pos {
+        // File identity changed or file shrank: cannot prove previously collected prefix.
+        db.execute(
+            "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+            [target],
+        )?;
+        return Ok(());
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            db.execute(
+                "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+                [target],
+            )?;
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("修复历史时无法打开日志文件 {}", path.display()))
+        }
+    };
+    if file_id(&file.metadata()?) != expected_fp {
+        db.execute(
+            "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+            [target],
+        )?;
+        return Ok(());
+    }
+    let Some(conv_id) = antigravity_conversation_id_from_path(root, path) else {
+        db.execute(
+            "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+            [target],
+        )?;
+        return Ok(());
+    };
+
+    let mut reader = BufReader::new(file.take(max_pos));
+    let mut records = Vec::new();
+    let mut bytes = Vec::new();
+    let mut read_pos = 0u64;
+    loop {
+        bytes.clear();
+        let len = reader.read_until(b'\n', &mut bytes)?;
+        if len == 0 || bytes.last() != Some(&b'\n') {
+            break;
+        }
+        read_pos += len as u64;
+        if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(rec) = record("antigravity", Some(&conv_id), &event) {
+                records.push(rec);
+            }
+        }
+    }
+
+    let tx = db.transaction()?;
+    for rec in &records {
+        upsert_antigravity_record(&tx, rec)?;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+        params![target, expected_fp, i64::try_from(read_pos)?],
+    )?;
+    tx.execute(
+        "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+        [target],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn repair_session_task(db: &mut rusqlite::Connection, root: &Path, session: &str) -> Result<()> {
+    let mut legacy_map: BTreeMap<String, LegacyV2Row> = BTreeMap::new();
+    let mut all_have_ns = true;
+    {
+        let mut stmt = db.prepare(
+            "SELECT response, at, at_ns, tokens, complete, input_tokens, cache_read_tokens, output_tokens
+             FROM usage
+             WHERE provider='antigravity' AND session=?1 AND legacy=1",
+        )?;
+        let rows = stmt.query_map([session], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+            ))
+        })?;
+        for row in rows {
+            let (resp, at, at_ns_opt, tokens, complete, inp, cr, out) = row?;
+            let Some(at_ns) = at_ns_opt else {
+                all_have_ns = false;
+                break;
+            };
+            legacy_map.insert(
+                resp,
+                LegacyV2Row {
+                    at,
+                    at_ns,
+                    tokens,
+                    complete,
+                    input: inp,
+                    cache_read: cr,
+                    output: out,
+                },
+            );
+        }
+    }
+
+    if !all_have_ns || legacy_map.is_empty() {
+        db.execute(
+            "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+            [session],
+        )?;
+        return Ok(());
+    }
+
+    let path = root
+        .join(session)
+        .join(".system_generated/logs/transcript.jsonl");
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            db.execute(
+                "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+                [session],
+            )?;
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("修复历史时无法打开日志文件 {}", path.display()))
+        }
+    };
+    let fp = file_id(&file.metadata()?);
+    let mut reader = BufReader::new(file);
+    let mut sim_v2: BTreeMap<String, LegacyV2Row> = BTreeMap::new();
+    let mut collected: Vec<(u64, ParsedRecord)> = Vec::new();
+    let mut bytes = Vec::new();
+    let mut byte_pos = 0u64;
+    let mut matched_pos: Option<u64> = None;
+    let mut diverged_after_match = false;
+    let mut ambiguous = false;
+
+    loop {
+        bytes.clear();
+        let len = reader.read_until(b'\n', &mut bytes)?;
+        if len == 0 || bytes.last() != Some(&b'\n') {
+            break;
+        }
+        byte_pos += len as u64;
+        if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(rec) = record("antigravity", Some(session), &event) {
+                collected.push((byte_pos, rec));
+            }
+            if let Some((resp, v2_row)) = antigravity_v2_step_from_event(&event) {
+                upsert_v2_sim(&mut sim_v2, resp, v2_row);
+            }
+        }
+        if matched_pos.is_none() {
+            if sim_v2 == legacy_map {
+                matched_pos = Some(byte_pos);
+            }
+        } else if !diverged_after_match {
+            if sim_v2 != legacy_map {
+                diverged_after_match = true;
+            }
+        } else if sim_v2 == legacy_map {
+            ambiguous = true;
+            break;
+        }
+    }
+
+    let tx = db.transaction()?;
+    if let Some(proven_pos) = matched_pos.filter(|_| !ambiguous) {
+        for (pos, rec) in &collected {
+            if *pos <= proven_pos {
+                upsert_antigravity_record(&tx, rec)?;
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+            params![path.to_string_lossy(), fp, i64::try_from(proven_pos)?],
+        )?;
+    }
+    tx.execute(
+        "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+        [session],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn import(

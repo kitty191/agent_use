@@ -3,7 +3,7 @@ use agent_core::{
     history::{self, Granularity},
     quota,
     store::Store,
-    usage::{Monitor, SourceStatus},
+    usage::{self, Monitor, SourceStatus},
 };
 use serde_json::json;
 use std::{
@@ -12,6 +12,19 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::tempdir;
+
+fn test_file_id(path: &std::path::Path) -> anyhow::Result<String> {
+    let meta = fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!("{}:{}", meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!("{:?}", meta.created().ok()))
+    }
+}
 
 fn agent(id: &str, status: &str) -> Agent {
     Agent {
@@ -908,25 +921,29 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
             [ts_dt(9, 0, 0).timestamp()],
         )?;
 
-        // Seed EOF cursors for Codex and Antigravity (using dummy fingerprints & exact file lengths).
+        // Seed EOF cursors for Codex and Antigravity using real file fingerprints & exact lengths.
         con.execute(
             "INSERT INTO cursors VALUES('codex', ?1, 'codex-fp', ?2)",
             rusqlite::params![codex_file.to_string_lossy(), codex_file.metadata()?.len() as i64],
         )?;
         for f in [&file_a, &file_b, &file_c] {
             con.execute(
-                "INSERT INTO cursors VALUES('antigravity', ?1, 'old-fp', ?2)",
-                rusqlite::params![f.to_string_lossy(), f.metadata()?.len() as i64],
+                "INSERT INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+                rusqlite::params![
+                    f.to_string_lossy(),
+                    test_file_id(f)?,
+                    f.metadata()?.len() as i64
+                ],
             )?;
         }
     }
 
-    // Open with new Store -> upgrades schema to v3, resets ONLY Antigravity cursors.
+    // Open with new Store -> upgrades schema to v4, preserves Antigravity cursors & queues repair tasks.
     let store = Store::open(&db_path)?;
     {
         let con = store.connect()?;
         let ver: i32 = con.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        assert_eq!(ver, 3);
+        assert_eq!(ver, 4);
         assert!(store.antigravity_repair_pending()?);
         let codex_cursor_fp: String = con.query_row(
             "SELECT fingerprint FROM cursors WHERE provider='codex'",
@@ -939,7 +956,7 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(ag_cursors_before, 0, "Antigravity cursors should be cleared once for backfill");
+        assert_eq!(ag_cursors_before, 3, "Antigravity cursors should be preserved to prove collected prefix");
     }
 
     // Run Antigravity monitor after upgrade:
@@ -1590,36 +1607,48 @@ fn v2_upgrade_repairs_antigravity_and_resumes_after_interruption() -> anyhow::Re
             [],
         )?;
         con.execute(
-            "INSERT INTO cursors VALUES('antigravity', ?1, 'old-fp', ?2)",
-            rusqlite::params![t1.to_string_lossy(), t1.metadata()?.len() as i64],
+            "INSERT INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+            rusqlite::params![
+                t1.to_string_lossy(),
+                test_file_id(&t1)?,
+                t1.metadata()?.len() as i64
+            ],
         )?;
         con.execute(
-            "INSERT INTO cursors VALUES('antigravity', ?1, 'old-fp2', ?2)",
-            rusqlite::params![t2.to_string_lossy(), t2.metadata()?.len() as i64],
+            "INSERT INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+            rusqlite::params![
+                t2.to_string_lossy(),
+                test_file_id(&t2)?,
+                t2.metadata()?.len() as i64
+            ],
         )?;
     }
 
-    // Open with new Store (v3 migration runs) and simulate interruption: hide conv-second during first repair pass,
-    // wait — simulate real mid-repair failure by making conv-second temporarily unreadable on unix (or checking pending state).
+    // Open with new Store (v4 migration runs) and simulate real mid-repair interruption via task permission error on t2.
     let store = Store::open(&db_v2)?;
     assert!(store.antigravity_repair_pending()?);
 
-    // Simulate interruption: first repair pass only sees conv-main (rename conv-second away temporarily and force pending back),
-    // verify conv-main gets EOF cursor & repaired rows, then restore conv-second while repair is still pending and resume!
-    let t2_backup = dir.path().join("conv-second-backup");
-    fs::rename(brain.join("conv-second"), &t2_backup)?;
-    Monitor::default().update(&store, "antigravity", &brain)?;
-    // Simulate crash right before mark_antigravity_repaired committed while conv-main was already committed at EOF:
-    store.connect()?.execute(
-        "INSERT OR REPLACE INTO meta(key,value) VALUES('antigravity_repair_version','2')",
-        [],
-    )?;
-    fs::rename(&t2_backup, brain.join("conv-second"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let orig_perms = fs::metadata(&t2)?.permissions();
+        fs::set_permissions(&t2, fs::Permissions::from_mode(0o000))?;
+        let first_attempt = usage::repair_antigravity_history(&store, &brain);
+        fs::set_permissions(&t2, orig_perms)?;
+        assert!(first_attempt.is_err(), "unreadable second transcript should pause repair");
+        assert!(store.antigravity_repair_pending()?);
+        let done_count: i64 = store.connect()?.query_row(
+            "SELECT COUNT(*) FROM antigravity_repair_tasks WHERE done=1",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(done_count, 1, "conv-main task should stay committed as done=1 across crash");
+    }
 
-    // Reopen Store & Monitor: resumes repair, skips already-repaired conv-main, repairs conv-second, marks v3 done!
+    // Reopen Store & resume repair without Monitor::update: skips done conv-main, repairs conv-second, marks v4 done!
     let store = Store::open(&db_v2)?;
     assert!(store.antigravity_repair_pending()?);
-    Monitor::default().update(&store, "antigravity", &brain)?;
+    usage::repair_antigravity_history(&store, &brain)?;
     assert!(!store.antigravity_repair_pending()?);
 
     // Build a fresh v3 DB from the exact same on-disk transcripts for field-by-field comparison.
@@ -1758,5 +1787,348 @@ fn history_year_granularity_monthly_drilldown_and_current_end_date_capping() -> 
         Some(300)
     );
     assert_eq!(y_drill.summary.verified_tokens, Some(375));
+    Ok(())
+}
+
+#[test]
+fn v2_upgrade_disabled_antigravity_repairs_only_collected_prefix_and_resumes() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dir = tempdir()?;
+    let db_v2 = dir.path().join("disabled_v2.sqlite");
+    let brain = dir.path().join("brain");
+
+    let logs1 = brain.join("conv-disabled/.system_generated/logs");
+    let logs2 = brain.join("conv-deleted/.system_generated/logs");
+    let logs_post_new = brain.join("conv-post-new/.system_generated/logs");
+    fs::create_dir_all(&logs1)?;
+    fs::create_dir_all(&logs2)?;
+    fs::create_dir_all(&logs_post_new)?;
+    let t1 = logs1.join("transcript.jsonl");
+    let t2 = logs2.join("transcript.jsonl");
+
+    // Pre-disable collected content in conv-disabled:
+    // - Step 1: DONE with all 3 token fields missing
+    // - Step 2: Nov 29 input=300, output=20 + Dec 1 cache_read=100
+    fs::write(
+        &t1,
+        [
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T09:00:00+08:00"}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T10:00:00+08:00", "input_tokens": 300, "output_tokens": 20}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-01T10:00:00+08:00", "cache_read_tokens": 100}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n")
+            + "\n",
+    )?;
+    let collected_end_pos = t1.metadata()?.len() as i64;
+    let fp1 = test_file_id(&t1)?;
+
+    // Deleted transcript recorded under v2 (no longer exists when upgrading)
+    fs::write(&t2, "{}\n")?;
+    let fp2 = test_file_id(&t2)?;
+    let pos2 = t2.metadata()?.len() as i64;
+    fs::remove_dir_all(brain.join("conv-deleted"))?;
+
+    // Build 7d76bf1 v2 database where Antigravity was ALREADY DISABLED before upgrading.
+    {
+        let con = rusqlite::Connection::open(&db_v2)?;
+        con.execute_batch(
+            "PRAGMA user_version=2;
+             CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE usage(provider TEXT, session TEXT, response TEXT, at INTEGER NOT NULL, tokens INTEGER NOT NULL, at_ns INTEGER, complete INTEGER NOT NULL DEFAULT 1, input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER, legacy INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(provider,session,response));
+             CREATE INDEX usage_date ON usage(provider,at);
+             CREATE TABLE cursors(provider TEXT, path TEXT, fingerprint TEXT, pos INTEGER NOT NULL, PRIMARY KEY(provider,path));",
+        )?;
+        let settings = json!({
+            "agents": [
+                {"id": "codex", "name": "OpenAI Codex", "status": "installed", "binary": null},
+                {"id": "antigravity", "name": "Antigravity", "status": "installed", "binary": null}
+            ],
+            "enabled": ["codex"],
+            "confirmed": true
+        });
+        con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
+        let dec1 = chrono::DateTime::parse_from_rfc3339("2026-12-01T10:00:00+08:00")?;
+        let nov28 = chrono::DateTime::parse_from_rfc3339("2026-11-28T10:00:00+08:00")?;
+        con.execute(
+            "INSERT INTO usage VALUES('antigravity','conv-disabled','2',?1,100,?2,0,NULL,100,NULL,0)",
+            rusqlite::params![dec1.timestamp(), dec1.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO usage VALUES('antigravity','conv-deleted','1',?1,777,?2,1,700,50,27,0)",
+            rusqlite::params![nov28.timestamp(), nov28.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+            rusqlite::params![t1.to_string_lossy(), fp1, collected_end_pos],
+        )?;
+        con.execute(
+            "INSERT INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+            rusqlite::params![t2.to_string_lossy(), fp2, pos2],
+        )?;
+    }
+
+    // Post-disable activity BEFORE upgrade: append Step 3 to t1 AND create brand-new conversation conv-post-new.
+    {
+        let mut f = fs::OpenOptions::new().append(true).open(&t1)?;
+        writeln!(
+            f,
+            "{}",
+            json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-02T10:00:00+08:00", "input_tokens": 900, "cache_read_tokens": 50, "output_tokens": 50})
+        )?;
+    }
+    fs::write(
+        logs_post_new.join("transcript.jsonl"),
+        format!(
+            "{}\n",
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-02T11:00:00+08:00", "input_tokens": 600, "cache_read_tokens": 100, "output_tokens": 100})
+        ),
+    )?;
+
+    // Upgrade at startup while Antigravity remains disabled.
+    let store = Store::open(&db_v2)?;
+    assert!(store.antigravity_repair_pending()?);
+    usage::repair_antigravity_history(&store, &brain)?;
+    assert!(!store.antigravity_repair_pending()?);
+
+    // Antigravity must stay disabled.
+    assert!(store.enabled_agent("antigravity").is_err());
+
+    // Read-only history query verifies:
+    // - Step 1 restored as 1 incomplete step (incomplete_known = None) on Nov 29
+    // - Step 2 restored as 420 on Nov 29
+    // - conv-deleted kept as unverified legacy (777) on Nov 28
+    // - Dec 2 post-disable append (Step 3 = 1000) and new conv (800) were NOT imported!
+    let today = NaiveDate::from_ymd_opt(2026, 12, 2).unwrap();
+    let day_page = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
+    let b28 = day_page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap();
+    assert_eq!((b28.verified_tokens, b28.legacy_steps, b28.legacy_tokens), (None, 1, Some(777)));
+    let b29 = day_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap();
+    assert_eq!((b29.verified_tokens, b29.verified_steps, b29.incomplete_steps, b29.incomplete_known.clone()), (Some(420), 1, 1, None));
+    let b01 = day_page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap();
+    assert_eq!((b01.verified_tokens, b01.incomplete_steps), (None, 0));
+    let b02 = day_page.buckets.iter().find(|b| b.key == "2026-12-02").unwrap();
+    assert_eq!((b02.verified_tokens, b02.incomplete_steps), (None, 0));
+
+    // Reopen twice: zero duplication.
+    for _ in 0..2 {
+        let s = Store::open(&db_v2)?;
+        assert!(!s.antigravity_repair_pending()?);
+        usage::repair_antigravity_history(&s, &brain)?;
+        let count: i64 = s.connect()?.query_row(
+            "SELECT COUNT(*) FROM usage WHERE provider='antigravity'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 3); // Step 1, Step 2, conv-deleted
+    }
+
+    Ok(())
+}
+
+#[test]
+fn v3_cursorless_disabled_antigravity_repairs_verifiable_and_keeps_unverifiable_legacy() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dir = tempdir()?;
+    let db_v3 = dir.path().join("disabled_v3.sqlite");
+    let brain = dir.path().join("brain");
+
+    let logs_ok = brain.join("conv-verifiable/.system_generated/logs");
+    let logs_mod = brain.join("conv-tampered/.system_generated/logs");
+    fs::create_dir_all(&logs_ok)?;
+    fs::create_dir_all(&logs_mod)?;
+    let t_ok = logs_ok.join("transcript.jsonl");
+    let t_mod = logs_mod.join("transcript.jsonl");
+
+    // Verifiable conversation: Step 1 (all missing) + Step 2 (Nov 29 in=300, out=20 -> Dec 1 cr=100) + post-disable Step 3 (999)
+    fs::write(
+        &t_ok,
+        [
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T09:00:00+08:00"}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T10:00:00+08:00", "input_tokens": 300, "output_tokens": 20}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-01T10:00:00+08:00", "cache_read_tokens": 100}),
+            json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-02T10:00:00+08:00", "input_tokens": 900, "cache_read_tokens": 49, "output_tokens": 50}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n")
+            + "\n",
+    )?;
+    // Unverifiable tampered log (on-disk step differs from v3 DB row -> cannot prove collection boundary)
+    fs::write(
+        &t_mod,
+        format!(
+            "{}\n",
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-28T09:00:00+08:00", "input_tokens": 111, "cache_read_tokens": 222, "output_tokens": 333})
+        ),
+    )?;
+
+    // Build an authentic v3 database from 969f12a/9c9f61a (user_version=3, cursors deleted, legacy=1, repair_version='2', Antigravity disabled).
+    {
+        let con = rusqlite::Connection::open(&db_v3)?;
+        con.execute_batch(
+            "PRAGMA user_version=3;
+             CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE usage(
+                provider TEXT, session TEXT, response TEXT, at INTEGER NOT NULL, tokens INTEGER NOT NULL,
+                at_ns INTEGER, complete INTEGER NOT NULL DEFAULT 1, input_tokens INTEGER,
+                cache_read_tokens INTEGER, output_tokens INTEGER, legacy INTEGER NOT NULL DEFAULT 0,
+                input_at_ns INTEGER, cache_read_at_ns INTEGER, output_at_ns INTEGER,
+                PRIMARY KEY(provider,session,response)
+             );
+             CREATE INDEX usage_date ON usage(provider,at);
+             CREATE TABLE cursors(provider TEXT, path TEXT, fingerprint TEXT, pos INTEGER NOT NULL, PRIMARY KEY(provider,path));",
+        )?;
+        let settings = json!({
+            "agents": [
+                {"id": "codex", "name": "OpenAI Codex", "status": "installed", "binary": null},
+                {"id": "antigravity", "name": "Antigravity", "status": "installed", "binary": null}
+            ],
+            "enabled": ["codex"],
+            "confirmed": true
+        });
+        con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
+        con.execute("INSERT INTO meta VALUES('antigravity_repair_version', '2')", [])?;
+
+        let dec1 = chrono::DateTime::parse_from_rfc3339("2026-12-01T10:00:00+08:00")?;
+        let nov28 = chrono::DateTime::parse_from_rfc3339("2026-11-28T09:00:00+08:00")?;
+        con.execute(
+            "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
+             VALUES('antigravity','conv-verifiable','2',?1,100,?2,0,NULL,100,NULL,1)",
+            rusqlite::params![dec1.timestamp(), dec1.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
+             VALUES('antigravity','conv-tampered','1',?1,555,?2,1,500,50,5,1)",
+            rusqlite::params![nov28.timestamp(), nov28.timestamp_nanos_opt()],
+        )?;
+    }
+
+    let store = Store::open(&db_v3)?;
+    assert!(store.antigravity_repair_pending()?);
+    usage::repair_antigravity_history(&store, &brain)?;
+    assert!(!store.antigravity_repair_pending()?);
+    assert!(store.enabled_agent("antigravity").is_err());
+
+    let today = NaiveDate::from_ymd_opt(2026, 12, 2).unwrap();
+    let page = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
+    let b28 = page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap();
+    // Tampered/unverifiable remains preserved as legacy unverified (555), NOT replaced with 666!
+    assert_eq!((b28.verified_tokens, b28.legacy_steps, b28.legacy_tokens), (None, 1, Some(555)));
+    let b29 = page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap();
+    // Verifiable session repairs Step 1 (incomplete) & Step 2 (420)
+    assert_eq!((b29.verified_tokens, b29.verified_steps, b29.incomplete_steps), (Some(420), 1, 1));
+    let b02 = page.buckets.iter().find(|b| b.key == "2026-12-02").unwrap();
+    // Post-disable Step 3 (999) was NOT imported!
+    assert_eq!(b02.verified_tokens, None);
+
+    // Reopen twice: idempotent, no duplicates
+    for _ in 0..2 {
+        let s = Store::open(&db_v3)?;
+        assert!(!s.antigravity_repair_pending()?);
+        let cnt: i64 = s.connect()?.query_row(
+            "SELECT COUNT(*) FROM usage WHERE provider='antigravity'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(cnt, 3);
+    }
+    Ok(())
+}
+
+#[test]
+fn history_current_period_caps_sql_upper_bound_at_today() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("monitor.sqlite"))?;
+    store.settings(false, || vec![agent("codex", "installed")])?;
+    store.select(vec!["codex".into()])?;
+
+    // Exact reproduction dataset: 11-26: 100, 11-27: 250, 12-01: 500
+    for (id, ts, tok) in [
+        ("r26", "2026-11-26T12:00:00+08:00", 100_i64),
+        ("r27", "2026-11-27T12:00:00+08:00", 250_i64),
+        ("r01", "2026-12-01T12:00:00+08:00", 500_i64),
+    ] {
+        let dt = chrono::DateTime::parse_from_rfc3339(ts)?;
+        store.connect()?.execute(
+            "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,legacy)
+             VALUES('codex','s1',?1,?2,?3,?4,1,0)",
+            rusqlite::params![id, dt.timestamp(), tok, dt.timestamp_nanos_opt()],
+        )?;
+    }
+
+    // At 2026-11-26 (Beijing time): Week, Month, Year AND all drill-downs MUST be 100 (NOT 350 or 850)!
+    let d26 = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+    let w26 = history::query_with_tz_and_drill(
+        &store, Granularity::Week, 0, None, None, None, d26, &tz, Some("2026-11-23..2026-11-29"),
+    )?;
+    assert_eq!(w26.buckets.iter().find(|b| b.key == "2026-11-23..2026-11-29").unwrap().verified_tokens, Some(100));
+    assert_eq!(w26.summary.verified_tokens, Some(100));
+    assert_eq!(w26.drill.as_ref().unwrap().summary.verified_tokens, Some(100));
+
+    let m26 = history::query_with_tz_and_drill(
+        &store, Granularity::Month, 0, None, None, None, d26, &tz, Some("2026-11"),
+    )?;
+    assert_eq!(m26.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens, Some(100));
+    assert_eq!(m26.summary.verified_tokens, Some(100));
+    assert_eq!(m26.drill.as_ref().unwrap().summary.verified_tokens, Some(100));
+
+    let y26 = history::query_with_tz_and_drill(
+        &store, Granularity::Year, 0, None, None, None, d26, &tz, Some("2026"),
+    )?;
+    assert_eq!(y26.buckets.iter().find(|b| b.key == "2026").unwrap().verified_tokens, Some(100));
+    assert_eq!(y26.summary.verified_tokens, Some(100));
+    let y26_drill = y26.drill.as_ref().unwrap();
+    assert_eq!(y26_drill.summary.verified_tokens, Some(100));
+    assert_eq!(y26_drill.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens, Some(100));
+
+    // Advance clock to 2026-11-27: 11-27 (250) is now included -> 350 across Week, Month, Year & drills; 12-01 (500) still excluded!
+    let d27 = NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
+    let w27 = history::query_with_tz_and_drill(
+        &store, Granularity::Week, 0, None, None, None, d27, &tz, Some("2026-11-23..2026-11-29"),
+    )?;
+    assert_eq!(w27.buckets.iter().find(|b| b.key == "2026-11-23..2026-11-29").unwrap().verified_tokens, Some(350));
+    assert_eq!(w27.drill.as_ref().unwrap().summary.verified_tokens, Some(350));
+
+    let m27 = history::query_with_tz_and_drill(
+        &store, Granularity::Month, 0, None, None, None, d27, &tz, Some("2026-11"),
+    )?;
+    assert_eq!(m27.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens, Some(350));
+    assert_eq!(m27.drill.as_ref().unwrap().summary.verified_tokens, Some(350));
+
+    let y27 = history::query_with_tz_and_drill(
+        &store, Granularity::Year, 0, None, None, None, d27, &tz, Some("2026"),
+    )?;
+    assert_eq!(y27.buckets.iter().find(|b| b.key == "2026").unwrap().verified_tokens, Some(350));
+    assert_eq!(y27.drill.as_ref().unwrap().summary.verified_tokens, Some(350));
+
+    // Completed period (in 2027-01): full natural month 2026-11 = 350, full natural year 2026 = 850.
+    let jan27 = NaiveDate::from_ymd_opt(2027, 1, 15).unwrap();
+    let y_done = history::query_with_tz_and_drill(
+        &store, Granularity::Year, 0, None, None, None, jan27, &tz, Some("2026"),
+    )?;
+    assert_eq!(y_done.buckets.iter().find(|b| b.key == "2026").unwrap().verified_tokens, Some(850));
+    assert_eq!(y_done.drill.as_ref().unwrap().summary.verified_tokens, Some(850));
+
+    // Explicit sub-month range honors exact start_date & end_date boundaries.
+    let partial_month = history::query_with_tz(
+        &store,
+        Granularity::Month,
+        0,
+        None,
+        Some(NaiveDate::from_ymd_opt(2026, 11, 27).unwrap()),
+        Some(NaiveDate::from_ymd_opt(2026, 11, 27).unwrap()),
+        jan27,
+        &tz,
+    )?;
+    assert_eq!(partial_month.buckets[0].start_date, "2026-11-27");
+    assert_eq!(partial_month.buckets[0].end_date, "2026-11-27");
+    assert_eq!(partial_month.summary.verified_tokens, Some(250));
     Ok(())
 }

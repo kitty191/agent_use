@@ -86,15 +86,17 @@ fn usage_history(
     provider: Option<String>,
     range_start: Option<String>,
     range_end: Option<String>,
+    drill_key: Option<String>,
 ) -> Result<history::HistoryPage, String> {
     let gran = history::Granularity::parse(&granularity).map_err(|e| e.to_string())?;
-    history::query(
+    history::query_with_drill(
         &app.db,
         gran,
         offset,
         provider.as_deref(),
         range_start.as_deref(),
         range_end.as_deref(),
+        drill_key.as_deref(),
     )
     .map_err(|e| e.to_string())
 }
@@ -108,9 +110,15 @@ fn main() {
                 .unwrap_or(app.path().app_local_data_dir()?);
             std::fs::create_dir_all(&path)?;
             let db = Store::open(&path.join("monitor.sqlite"))?;
+            let home = app.path().home_dir()?;
+            if let Some(root) = discovery::log_root("antigravity", &home) {
+                if let Err(err) = usage::repair_antigravity_history(&db, &root) {
+                    eprintln!("[agent-use] antigravity history repair deferred: {err}");
+                }
+            }
             app.manage(App {
                 db: Arc::new(db),
-                home: app.path().home_dir()?,
+                home,
                 querying: false.into(),
                 monitors: Mutex::default(),
             });

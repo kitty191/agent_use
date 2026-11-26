@@ -99,6 +99,8 @@ pub struct HistoryPage {
     pub available_providers: Vec<ProviderOption>,
     pub summary: HistorySummary,
     pub buckets: Vec<HistoryBucket>,
+    pub drill_key: Option<String>,
+    pub drill: Option<Box<HistoryPage>>,
 }
 
 #[derive(Default, Clone)]
@@ -284,16 +286,18 @@ fn build_month_specs_range<Tz: TimeZone>(
         if specs.len() >= 120 {
             bail!("单次月份明细范围不能超过 120 个月");
         }
-        let (ms, me, next_start) = month_bounds(y, m)?;
-        let is_current = today >= ms && today <= me;
-        let display_end = if is_current && me > today { today } else { me };
+        let (ms, me, _) = month_bounds(y, m)?;
+        let effective_start = ms.max(start);
+        let effective_end = me.min(end_inclusive);
+        let exclusive_end = effective_end.succ_opt().context("日期溢出")?;
+        let is_current = today >= effective_start && today <= effective_end;
         specs.push(BucketSpec {
             key: format!("{y:04}-{m:02}"),
             label: format!("{y}年{m}月"),
-            start_date: ms,
-            end_date: display_end,
-            start_sec: local_day_start_sec(ms, tz)?,
-            end_sec: local_day_start_sec(next_start, tz)?,
+            start_date: effective_start,
+            end_date: effective_end,
+            start_sec: local_day_start_sec(effective_start, tz)?,
+            end_sec: local_day_start_sec(exclusive_end, tz)?,
             is_current,
         });
         let (ny, nm) = shift_months(y, m, 1)?;
@@ -342,9 +346,9 @@ fn build_specs<Tz: TimeZone>(
             for i in 0..count {
                 let mon = start_mon + Duration::days(i as i64 * 7);
                 let sun = mon + Duration::days(6);
-                let next_mon = mon + Duration::days(7);
                 let is_current = today >= mon && today <= sun;
                 let display_end = if is_current && sun > today { today } else { sun };
+                let exclusive_end = display_end.succ_opt().context("日期溢出")?;
                 let same_year = mon.year() == display_end.year();
                 let label = if same_year {
                     format!("{} – {}", mon.format("%m/%d"), display_end.format("%m/%d"))
@@ -365,7 +369,7 @@ fn build_specs<Tz: TimeZone>(
                     start_date: mon,
                     end_date: display_end,
                     start_sec: local_day_start_sec(mon, tz)?,
-                    end_sec: local_day_start_sec(next_mon, tz)?,
+                    end_sec: local_day_start_sec(exclusive_end, tz)?,
                     is_current,
                 });
             }
@@ -378,16 +382,17 @@ fn build_specs<Tz: TimeZone>(
             let mut specs = Vec::with_capacity(count);
             for i in 0..count {
                 let (y, m) = shift_months(start_y, start_m, i as i32)?;
-                let (start, end, next_start) = month_bounds(y, m)?;
+                let (start, end, _) = month_bounds(y, m)?;
                 let is_current = today >= start && today <= end;
                 let display_end = if is_current && end > today { today } else { end };
+                let exclusive_end = display_end.succ_opt().context("日期溢出")?;
                 specs.push(BucketSpec {
                     key: format!("{y:04}-{m:02}"),
                     label: format!("{y}年{m}月"),
                     start_date: start,
                     end_date: display_end,
                     start_sec: local_day_start_sec(start, tz)?,
-                    end_sec: local_day_start_sec(next_start, tz)?,
+                    end_sec: local_day_start_sec(exclusive_end, tz)?,
                     is_current,
                 });
             }
@@ -400,16 +405,16 @@ fn build_specs<Tz: TimeZone>(
             for y in start_y..=end_y {
                 let start = NaiveDate::from_ymd_opt(y, 1, 1).context("无效年份")?;
                 let end = NaiveDate::from_ymd_opt(y, 12, 31).context("无效年末")?;
-                let next_start = NaiveDate::from_ymd_opt(y + 1, 1, 1).context("无效下年")?;
                 let is_current = today.year() == y;
                 let display_end = if is_current && end > today { today } else { end };
+                let exclusive_end = display_end.succ_opt().context("日期溢出")?;
                 specs.push(BucketSpec {
                     key: format!("{y:04}"),
                     label: format!("{y}年"),
                     start_date: start,
                     end_date: display_end,
                     start_sec: local_day_start_sec(start, tz)?,
-                    end_sec: local_day_start_sec(next_start, tz)?,
+                    end_sec: local_day_start_sec(exclusive_end, tz)?,
                     is_current,
                 });
             }
@@ -426,6 +431,26 @@ pub fn query(
     range_start: Option<&str>,
     range_end: Option<&str>,
 ) -> Result<HistoryPage> {
+    query_with_drill(
+        store,
+        granularity,
+        offset,
+        provider,
+        range_start,
+        range_end,
+        None,
+    )
+}
+
+pub fn query_with_drill(
+    store: &Store,
+    granularity: Granularity,
+    offset: u32,
+    provider: Option<&str>,
+    range_start: Option<&str>,
+    range_end: Option<&str>,
+    drill_key: Option<&str>,
+) -> Result<HistoryPage> {
     let today = Local::now().date_naive();
     let rs = range_start
         .map(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").context("无效起始日期"))
@@ -433,7 +458,17 @@ pub fn query(
     let re = range_end
         .map(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").context("无效结束日期"))
         .transpose()?;
-    query_with_tz(store, granularity, offset, provider, rs, re, today, &Local)
+    query_with_tz_and_drill(
+        store,
+        granularity,
+        offset,
+        provider,
+        rs,
+        re,
+        today,
+        &Local,
+        drill_key,
+    )
 }
 
 pub fn query_with_tz<Tz: TimeZone>(
@@ -446,7 +481,115 @@ pub fn query_with_tz<Tz: TimeZone>(
     today: NaiveDate,
     tz: &Tz,
 ) -> Result<HistoryPage> {
-    let db = store.connect()?;
+    query_with_tz_and_drill(
+        store,
+        granularity,
+        offset,
+        provider,
+        range_start,
+        range_end,
+        today,
+        tz,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn query_with_tz_and_drill<Tz: TimeZone>(
+    store: &Store,
+    granularity: Granularity,
+    offset: u32,
+    provider: Option<&str>,
+    range_start: Option<NaiveDate>,
+    range_end: Option<NaiveDate>,
+    today: NaiveDate,
+    tz: &Tz,
+    drill_key: Option<&str>,
+) -> Result<HistoryPage> {
+    query_with_tz_and_drill_with_hook(
+        store,
+        granularity,
+        offset,
+        provider,
+        range_start,
+        range_end,
+        today,
+        tz,
+        drill_key,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_with_tz_and_drill_with_hook<Tz: TimeZone>(
+    store: &Store,
+    granularity: Granularity,
+    offset: u32,
+    provider: Option<&str>,
+    range_start: Option<NaiveDate>,
+    range_end: Option<NaiveDate>,
+    today: NaiveDate,
+    tz: &Tz,
+    drill_key: Option<&str>,
+    mut between_queries_hook: impl FnMut(),
+) -> Result<HistoryPage> {
+    let mut db = store.connect()?;
+    db.pragma_update(None, "query_only", true)?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+    let mut page = query_page_on_tx(
+        &tx,
+        granularity,
+        offset,
+        provider,
+        range_start,
+        range_end,
+        today,
+        tz,
+    )?;
+
+    between_queries_hook();
+
+    if let Some(key) = drill_key.filter(|k| !k.is_empty()) {
+        if granularity != Granularity::Day && range_start.is_none() && range_end.is_none() {
+            if let Some(bucket) = page.buckets.iter().find(|b| b.key == key) {
+                let child_gran = match granularity {
+                    Granularity::Year => Granularity::Month,
+                    _ => Granularity::Day,
+                };
+                let bs = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d")
+                    .context("无效明细起始日期")?;
+                let be = NaiveDate::parse_from_str(&bucket.end_date, "%Y-%m-%d")
+                    .context("无效明细结束日期")?;
+                let child = query_page_on_tx(
+                    &tx,
+                    child_gran,
+                    0,
+                    provider,
+                    Some(bs),
+                    Some(be),
+                    today,
+                    tz,
+                )?;
+                page.drill_key = Some(key.to_string());
+                page.drill = Some(Box::new(child));
+            }
+        }
+    }
+
+    Ok(page)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_page_on_tx<Tz: TimeZone>(
+    db: &rusqlite::Connection,
+    granularity: Granularity,
+    offset: u32,
+    provider: Option<&str>,
+    range_start: Option<NaiveDate>,
+    range_end: Option<NaiveDate>,
+    today: NaiveDate,
+    tz: &Tz,
+) -> Result<HistoryPage> {
     let enabled_set: HashSet<String> = db
         .query_row("SELECT data FROM settings WHERE id=1", [], |r| {
             r.get::<_, String>(0)
@@ -625,5 +768,102 @@ pub fn query_with_tz<Tz: TimeZone>(
         available_providers,
         summary,
         buckets,
+        drill_key: None,
+        drill: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::Agent;
+    use chrono::FixedOffset;
+    use rusqlite::params;
+    use tempfile::tempdir;
+
+    #[test]
+    fn snapshot_transaction_keeps_parent_and_drill_consistent_under_concurrent_write() -> Result<()> {
+        let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+        let dir = tempdir()?;
+        let store = Store::open(&dir.path().join("monitor.sqlite"))?;
+        store.settings(false, || {
+            vec![Agent {
+                id: "codex".into(),
+                name: "OpenAI Codex".into(),
+                status: "installed".into(),
+                binary: None,
+            }]
+        })?;
+        store.select(vec!["codex".into()])?;
+
+        let ts1 = chrono::DateTime::parse_from_rfc3339("2026-11-25T10:00:00+08:00")?.timestamp();
+        store.connect()?.execute(
+            "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,legacy)
+             VALUES('codex','s1','r1',?1,300,?2,1,0)",
+            params![ts1, ts1 * 1_000_000_000],
+        )?;
+
+        let today = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        let mut injected = false;
+        let page1 = query_with_tz_and_drill_with_hook(
+            &store,
+            Granularity::Week,
+            0,
+            None,
+            None,
+            None,
+            today,
+            &tz,
+            Some("2026-11-23..2026-11-29"),
+            || {
+                if !injected {
+                    injected = true;
+                    let ts2 = chrono::DateTime::parse_from_rfc3339("2026-11-26T10:00:00+08:00")
+                        .unwrap()
+                        .timestamp();
+                    store
+                        .connect()
+                        .unwrap()
+                        .execute(
+                            "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,legacy)
+                             VALUES('codex','s1','r2',?1,250,?2,1,0)",
+                            params![ts2, ts2 * 1_000_000_000],
+                        )
+                        .unwrap();
+                }
+            },
+        )?;
+
+        let parent_week = page1
+            .buckets
+            .iter()
+            .find(|b| b.key == "2026-11-23..2026-11-29")
+            .unwrap();
+        let drill1 = page1.drill.as_ref().unwrap();
+        // Same snapshot: BOTH parent (300) and drill (300) see pre-write state, never 300 vs 550.
+        assert_eq!(parent_week.verified_tokens, Some(300));
+        assert_eq!(drill1.summary.verified_tokens, Some(300));
+
+        // Subsequent query sees 550 in BOTH parent and drill.
+        let page2 = query_with_tz_and_drill(
+            &store,
+            Granularity::Week,
+            0,
+            None,
+            None,
+            None,
+            today,
+            &tz,
+            Some("2026-11-23..2026-11-29"),
+        )?;
+        let parent_week2 = page2
+            .buckets
+            .iter()
+            .find(|b| b.key == "2026-11-23..2026-11-29")
+            .unwrap();
+        let drill2 = page2.drill.as_ref().unwrap();
+        assert_eq!(parent_week2.verified_tokens, Some(550));
+        assert_eq!(drill2.summary.verified_tokens, Some(550));
+        Ok(())
+    }
 }
