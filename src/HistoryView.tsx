@@ -8,7 +8,7 @@ function localDateKey(d = new Date()) {
   return `${y}-${m}-${day}`;
 }
 
-export type Granularity = "day" | "week" | "month";
+export type Granularity = "day" | "week" | "month" | "year";
 
 export type TokenParts = {
   input: number | null;
@@ -132,6 +132,28 @@ function formatBucketPeriod(b: HistoryBucket, granularity: Granularity) {
   return b.label;
 }
 
+function formatRangeSummary(page: HistoryPage) {
+  const hasCurrent = page.buckets.some((b) => b.is_current);
+  if (page.granularity === "month" && page.buckets.length > 0) {
+    const first = page.buckets[0];
+    const last = page.buckets[page.buckets.length - 1];
+    return `${first.key} ~ ${last.key}${hasCurrent ? `（截至 ${page.range_end}）` : ""}`;
+  }
+  if (page.granularity === "year" && page.buckets.length > 0) {
+    const first = page.buckets[0];
+    const last = page.buckets[page.buckets.length - 1];
+    return `${first.label} ~ ${last.label}${hasCurrent ? `（截至 ${page.range_end}）` : ""}`;
+  }
+  if (page.granularity === "week") {
+    return `${page.range_start} ~ ${page.range_end}${hasCurrent ? "（截至今天）" : ""}`;
+  }
+  return `${page.range_start} ~ ${page.range_end}`;
+}
+
+function drillGranularity(granularity: Granularity): Granularity {
+  return granularity === "year" ? "month" : "day";
+}
+
 function TrendChart({
   buckets,
   granularity,
@@ -203,7 +225,9 @@ function TrendChart({
         ) : (
           <span className="muted">
             {onSelect
-              ? "悬停柱状图查看精确数值，点击任意周期展开每日明细"
+              ? granularity === "year"
+                ? "悬停柱状图查看精确数值，点击任意年份展开每月明细"
+                : "悬停柱状图查看精确数值，点击任意周期展开每日明细"
               : "悬停柱状图查看当日精确数值与平台分项"}
           </span>
         )}
@@ -359,7 +383,9 @@ function TrendChart({
                     ? b.start_date.slice(5)
                     : granularity === "month"
                       ? b.key.slice(2)
-                      : b.label}
+                      : granularity === "year"
+                        ? b.key
+                        : b.label}
                 </text>
               )}
             </g>
@@ -449,7 +475,11 @@ function HistoryTable({
                       >
                         <span>{formatBucketPeriod(b, granularity)}</span>
                         <span className="drill-cue">
-                          {selected ? "已展开" : "查看每日 ›"}
+                          {selected
+                            ? "已展开"
+                            : granularity === "year"
+                              ? "查看每月 ›"
+                              : "查看每日 ›"}
                         </span>
                       </button>
                     ) : (
@@ -634,7 +664,7 @@ export function HistoryView({ active }: { active: boolean }) {
       }
       try {
         const data = await invoke<HistoryPage>("usage_history", {
-          granularity: "day",
+          granularity: drillGranularity(granularity),
           offset: 0,
           provider: provider === "all" ? null : provider,
           rangeStart: bucket.start_date,
@@ -658,10 +688,10 @@ export function HistoryView({ active }: { active: boolean }) {
         }
       }
     },
-    [provider],
+    [granularity, provider],
   );
 
-  // Synchronized silent refresh for parent list + open daily drill-down (and local midnight rollover).
+  // Synchronized silent refresh for parent list + open drill-down (and local midnight rollover).
   const refreshVisible = useCallback(async () => {
     const queryKey = `${granularity}|${offset}|${provider}`;
     const mainReqId = ++mainReqRef.current;
@@ -684,7 +714,7 @@ export function HistoryView({ active }: { active: boolean }) {
 
     const drillPromise = activeDrill
       ? invoke<HistoryPage>("usage_history", {
-          granularity: "day",
+          granularity: drillGranularity(granularity),
           offset: 0,
           provider: provider === "all" ? null : provider,
           rangeStart: activeDrill.start_date,
@@ -698,6 +728,7 @@ export function HistoryView({ active }: { active: boolean }) {
     const [mainRes, drillRes] = await Promise.all([mainPromise, drillPromise]);
     if (!mountedRef.current) return;
 
+    let expandedBucket: HistoryBucket | null = null;
     if (mainReqId === mainReqRef.current) {
       if (mainRes.ok) {
         mainKeyRef.current = queryKey;
@@ -707,6 +738,9 @@ export function HistoryView({ active }: { active: boolean }) {
         if (openKey) {
           const updated = mainRes.data.buckets.find((b) => b.key === openKey);
           if (updated) {
+            if (activeDrill && updated.end_date !== activeDrill.end_date) {
+              expandedBucket = updated;
+            }
             drillBucketRef.current = updated;
             setDrillBucket(updated);
           }
@@ -714,6 +748,11 @@ export function HistoryView({ active }: { active: boolean }) {
       } else {
         setError(String(mainRes.err));
       }
+    }
+
+    if (expandedBucket) {
+      void fetchDrill(expandedBucket, true);
+      return;
     }
 
     if (
@@ -729,7 +768,7 @@ export function HistoryView({ active }: { active: boolean }) {
         setDrillError(String(drillRes.err));
       }
     }
-  }, [granularity, offset, provider]);
+  }, [granularity, offset, provider, fetchDrill]);
 
   // Initial load & reset drill-down whenever granularity, offset, or provider changes.
   useEffect(() => {
@@ -797,6 +836,7 @@ export function HistoryView({ active }: { active: boolean }) {
                 ["day", "按日"],
                 ["week", "按周"],
                 ["month", "按月"],
+                ["year", "按年"],
               ] as const
             ).map(([g, label]) => (
               <button
@@ -848,7 +888,7 @@ export function HistoryView({ active }: { active: boolean }) {
         <div className="pager-row">
           <div className="pager-info">
             <span className="range-text">
-              {page ? `${page.range_start} ~ ${page.range_end}` : "载入中…"}
+              {page ? formatRangeSummary(page) : "载入中…"}
             </span>
             {page?.earliest_date && (
               <small className="earliest-note">
@@ -982,13 +1022,17 @@ export function HistoryView({ active }: { active: boolean }) {
                   ? "每日用量趋势"
                   : granularity === "week"
                     ? "每周用量趋势"
-                    : "每月用量趋势"}
+                    : granularity === "month"
+                      ? "每月用量趋势"
+                      : "每年用量趋势"}
               </h2>
               <small>
                 图表与下方明细表基于同一批 SQLite 记录；
-                {granularity !== "day"
-                  ? "点击柱条或周期行可查看每日明细"
-                  : "按本地 00:00 划分自然日"}
+                {granularity === "year"
+                  ? "点击柱条或年份行可查看每月明细"
+                  : granularity !== "day"
+                    ? "点击柱条或周期行可查看每日明细"
+                    : "按本地 00:00 划分自然日"}
               </small>
             </div>
             {loading && <span className="count-pill">查询中…</span>}
@@ -1006,7 +1050,9 @@ export function HistoryView({ active }: { active: boolean }) {
         <section className="panel drill-panel" data-drill-key={drillBucket.key}>
           <div className="section-head">
             <div>
-              <span className="eyebrow">周期每日明细</span>
+              <span className="eyebrow">
+                {granularity === "year" ? "年度每月明细" : "周期每日明细"}
+              </span>
               <h2>
                 {formatBucketPeriod(drillBucket, granularity)}
                 {drillBucket.is_current && (
@@ -1016,7 +1062,7 @@ export function HistoryView({ active }: { active: boolean }) {
               <small>
                 周期已核验完整合计：{primaryValueLabel(drillBucket)}
                 {drillPage?.summary.verified_tokens != null
-                  ? `（逐日合计 ${drillPage.summary.verified_tokens.toLocaleString()}）`
+                  ? `（${granularity === "year" ? "逐月" : "逐日"}合计 ${drillPage.summary.verified_tokens.toLocaleString()}）`
                   : ""}
               </small>
             </div>
@@ -1025,7 +1071,7 @@ export function HistoryView({ active }: { active: boolean }) {
               className="btn-ghost btn-sm"
               onClick={closeDrill}
             >
-              收起每日明细
+              {granularity === "year" ? "收起每月明细" : "收起每日明细"}
             </button>
           </div>
 
@@ -1043,16 +1089,21 @@ export function HistoryView({ active }: { active: boolean }) {
           )}
 
           {drillLoading ? (
-            <p className="muted">正在读取每日明细…</p>
+            <p className="muted">
+              {granularity === "year" ? "正在读取每月明细…" : "正在读取每日明细…"}
+            </p>
           ) : (
             drillPage && (
               <>
                 <TrendChart
                   buckets={drillPage.buckets}
-                  granularity="day"
+                  granularity={drillGranularity(granularity)}
                   compact
                 />
-                <HistoryTable buckets={drillPage.buckets} granularity="day" />
+                <HistoryTable
+                  buckets={drillPage.buckets}
+                  granularity={drillGranularity(granularity)}
+                />
               </>
             )
           )}
@@ -1070,7 +1121,9 @@ export function HistoryView({ active }: { active: boolean }) {
                   ? "自然日"
                   : granularity === "week"
                     ? "自然周（周一起算）"
-                    : "自然月"}
+                    : granularity === "month"
+                      ? "自然月"
+                      : "自然年"}
               </small>
             </div>
             <span className="count-pill">共 {page.buckets.length} 条</span>

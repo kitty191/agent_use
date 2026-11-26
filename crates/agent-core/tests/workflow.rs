@@ -1665,3 +1665,98 @@ fn v2_upgrade_repairs_antigravity_and_resumes_after_interruption() -> anyhow::Re
     assert_eq!(codex_fp, "codex-fp");
     Ok(())
 }
+
+#[test]
+fn history_year_granularity_monthly_drilldown_and_current_end_date_capping() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("monitor.sqlite"))?;
+    store.settings(false, || vec![agent("codex", "installed")])?;
+    store.select(vec!["codex".into()])?;
+
+    let sessions = dir.path().join("sessions");
+    fs::create_dir_all(&sessions)?;
+    let write_ev = |id: &str, rfc: &str, tokens: i64| {
+        json!({
+            "type": "token_usage_record",
+            "timestamp": rfc,
+            "payload": {"session_id": "s1", "response_id": id, "usage": {"total_tokens": tokens}}
+        })
+    };
+    fs::write(
+        sessions.join("yearly.jsonl"),
+        [
+            write_ev("y1", "2025-12-31T23:59:59+08:00", 50),
+            write_ev("y2", "2026-01-01T00:00:00+08:00", 75),
+            write_ev("y3", "2026-11-25T12:00:00+08:00", 100),
+            write_ev("y4", "2026-11-26T12:00:00+08:00", 200),
+        ]
+        .map(|v| v.to_string())
+        .join("\n")
+            + "\n",
+    )?;
+    Monitor::default().update(&store, "codex", &sessions)?;
+
+    let today = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+
+    // Week: current week end_date & range_end must cap at today (2026-11-26), not Sunday (2026-11-29).
+    let week_page =
+        history::query_with_tz(&store, Granularity::Week, 0, None, None, None, today, &tz)?;
+    assert_eq!(week_page.range_end, "2026-11-26");
+    let w_curr = week_page
+        .buckets
+        .iter()
+        .find(|b| b.key == "2026-11-23..2026-11-29")
+        .unwrap();
+    assert!(w_curr.is_current);
+    assert_eq!(w_curr.end_date, "2026-11-26");
+    assert_eq!(w_curr.verified_tokens, Some(300));
+
+    // Month: current month end_date & range_end must cap at today (2026-11-26), not month-end (2026-11-30).
+    let month_page =
+        history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
+    assert_eq!(month_page.range_end, "2026-11-26");
+    let m_curr = month_page.buckets.iter().find(|b| b.key == "2026-11").unwrap();
+    assert!(m_curr.is_current);
+    assert_eq!(m_curr.end_date, "2026-11-26");
+    assert_eq!(m_curr.verified_tokens, Some(300));
+
+    // Year: returns 5 calendar years (2022..2026), range_end == "2026-11-26".
+    let year_page =
+        history::query_with_tz(&store, Granularity::Year, 0, None, None, None, today, &tz)?;
+    assert_eq!(year_page.buckets.len(), 5);
+    assert_eq!(year_page.range_start, "2022-01-01");
+    assert_eq!(year_page.range_end, "2026-11-26");
+    let y2025 = year_page.buckets.iter().find(|b| b.key == "2025").unwrap();
+    assert!(!y2025.is_current);
+    assert_eq!(y2025.end_date, "2025-12-31");
+    assert_eq!(y2025.verified_tokens, Some(50));
+    let y2026 = year_page.buckets.iter().find(|b| b.key == "2026").unwrap();
+    assert!(y2026.is_current);
+    assert_eq!(y2026.end_date, "2026-11-26");
+    assert_eq!(y2026.verified_tokens, Some(375));
+
+    // Year monthly drill-down (2026-01-01 .. 2026-11-26): 11 months (2026-01 .. 2026-11), not 2026-12.
+    let y_drill = history::query_with_tz(
+        &store,
+        Granularity::Month,
+        0,
+        None,
+        Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+        Some(NaiveDate::from_ymd_opt(2026, 11, 26).unwrap()),
+        today,
+        &tz,
+    )?;
+    assert_eq!(y_drill.buckets.len(), 11);
+    assert_eq!(
+        y_drill.buckets.iter().find(|b| b.key == "2026-01").unwrap().verified_tokens,
+        Some(75)
+    );
+    assert_eq!(
+        y_drill.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens,
+        Some(300)
+    );
+    assert_eq!(y_drill.summary.verified_tokens, Some(375));
+    Ok(())
+}

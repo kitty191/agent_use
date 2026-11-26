@@ -14,6 +14,7 @@ pub enum Granularity {
     Day,
     Week,
     Month,
+    Year,
 }
 
 impl Granularity {
@@ -22,6 +23,7 @@ impl Granularity {
             "day" => Ok(Self::Day),
             "week" => Ok(Self::Week),
             "month" => Ok(Self::Month),
+            "year" => Ok(Self::Year),
             _ => bail!("不支持的统计粒度: {raw}"),
         }
     }
@@ -31,6 +33,7 @@ impl Granularity {
             Self::Day => 30,
             Self::Week => 12,
             Self::Month => 12,
+            Self::Year => 5,
         }
     }
 }
@@ -267,6 +270,39 @@ fn build_day_specs<Tz: TimeZone>(
     Ok(specs)
 }
 
+fn build_month_specs_range<Tz: TimeZone>(
+    start: NaiveDate,
+    end_inclusive: NaiveDate,
+    today: NaiveDate,
+    tz: &Tz,
+) -> Result<Vec<BucketSpec>> {
+    let mut specs = Vec::new();
+    let mut y = start.year();
+    let mut m = start.month();
+    let end_ym = (end_inclusive.year(), end_inclusive.month());
+    while (y, m) <= end_ym {
+        if specs.len() >= 120 {
+            bail!("单次月份明细范围不能超过 120 个月");
+        }
+        let (ms, me, next_start) = month_bounds(y, m)?;
+        let is_current = today >= ms && today <= me;
+        let display_end = if is_current && me > today { today } else { me };
+        specs.push(BucketSpec {
+            key: format!("{y:04}-{m:02}"),
+            label: format!("{y}年{m}月"),
+            start_date: ms,
+            end_date: display_end,
+            start_sec: local_day_start_sec(ms, tz)?,
+            end_sec: local_day_start_sec(next_start, tz)?,
+            is_current,
+        });
+        let (ny, nm) = shift_months(y, m, 1)?;
+        y = ny;
+        m = nm;
+    }
+    Ok(specs)
+}
+
 fn build_specs<Tz: TimeZone>(
     granularity: Granularity,
     offset: u32,
@@ -279,11 +315,16 @@ fn build_specs<Tz: TimeZone>(
         if rs > re {
             bail!("起始日期不能晚于结束日期");
         }
-        let span = (re - rs).num_days();
-        if span > 366 {
-            bail!("单次日期明细范围不能超过 366 天");
-        }
-        return build_day_specs(rs, re, today, tz);
+        return match granularity {
+            Granularity::Month => build_month_specs_range(rs, re, today, tz),
+            _ => {
+                let span = (re - rs).num_days();
+                if span > 366 {
+                    bail!("单次日期明细范围不能超过 366 天");
+                }
+                build_day_specs(rs, re, today, tz)
+            }
+        };
     }
 
     let count = granularity.page_size();
@@ -302,11 +343,17 @@ fn build_specs<Tz: TimeZone>(
                 let mon = start_mon + Duration::days(i as i64 * 7);
                 let sun = mon + Duration::days(6);
                 let next_mon = mon + Duration::days(7);
-                let same_year = mon.year() == sun.year();
+                let is_current = today >= mon && today <= sun;
+                let display_end = if is_current && sun > today { today } else { sun };
+                let same_year = mon.year() == display_end.year();
                 let label = if same_year {
-                    format!("{} – {}", mon.format("%m/%d"), sun.format("%m/%d"))
+                    format!("{} – {}", mon.format("%m/%d"), display_end.format("%m/%d"))
                 } else {
-                    format!("{} – {}", mon.format("%Y/%m/%d"), sun.format("%Y/%m/%d"))
+                    format!(
+                        "{} – {}",
+                        mon.format("%Y/%m/%d"),
+                        display_end.format("%Y/%m/%d")
+                    )
                 };
                 specs.push(BucketSpec {
                     key: format!(
@@ -316,10 +363,10 @@ fn build_specs<Tz: TimeZone>(
                     ),
                     label,
                     start_date: mon,
-                    end_date: sun,
+                    end_date: display_end,
                     start_sec: local_day_start_sec(mon, tz)?,
                     end_sec: local_day_start_sec(next_mon, tz)?,
-                    is_current: today >= mon && today <= sun,
+                    is_current,
                 });
             }
             Ok(specs)
@@ -332,14 +379,38 @@ fn build_specs<Tz: TimeZone>(
             for i in 0..count {
                 let (y, m) = shift_months(start_y, start_m, i as i32)?;
                 let (start, end, next_start) = month_bounds(y, m)?;
+                let is_current = today >= start && today <= end;
+                let display_end = if is_current && end > today { today } else { end };
                 specs.push(BucketSpec {
                     key: format!("{y:04}-{m:02}"),
                     label: format!("{y}年{m}月"),
                     start_date: start,
-                    end_date: end,
+                    end_date: display_end,
                     start_sec: local_day_start_sec(start, tz)?,
                     end_sec: local_day_start_sec(next_start, tz)?,
-                    is_current: today >= start && today <= end,
+                    is_current,
+                });
+            }
+            Ok(specs)
+        }
+        Granularity::Year => {
+            let end_y = today.year() - (offset as i32 * count as i32);
+            let start_y = end_y - (count as i32 - 1);
+            let mut specs = Vec::with_capacity(count);
+            for y in start_y..=end_y {
+                let start = NaiveDate::from_ymd_opt(y, 1, 1).context("无效年份")?;
+                let end = NaiveDate::from_ymd_opt(y, 12, 31).context("无效年末")?;
+                let next_start = NaiveDate::from_ymd_opt(y + 1, 1, 1).context("无效下年")?;
+                let is_current = today.year() == y;
+                let display_end = if is_current && end > today { today } else { end };
+                specs.push(BucketSpec {
+                    key: format!("{y:04}"),
+                    label: format!("{y}年"),
+                    start_date: start,
+                    end_date: display_end,
+                    start_sec: local_day_start_sec(start, tz)?,
+                    end_sec: local_day_start_sec(next_start, tz)?,
+                    is_current,
                 });
             }
             Ok(specs)
