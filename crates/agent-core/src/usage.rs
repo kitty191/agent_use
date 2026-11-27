@@ -18,6 +18,7 @@ use walkdir::WalkDir;
 #[serde(rename_all = "snake_case")]
 pub enum SourceStatus {
     Active,
+    Partial,
     Waiting,
 }
 
@@ -44,6 +45,8 @@ pub struct Usage {
     pub latest_legacy: bool,
     pub latest_legacy_tokens: Option<i64>,
     pub status: SourceStatus,
+    pub unreadable_files: usize,
+    pub warning: Option<String>,
 }
 
 struct ParsedRecord {
@@ -67,6 +70,13 @@ struct Changes {
 // Recheck active rollouts on every UI poll even when the filesystem drops a notification.
 const HOT_LOG_LIMIT: usize = 16;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const FAILED_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+struct FailedFile {
+    sig: Option<(u32, i64, u64)>,
+    next_retry: Instant,
+    reason: String,
+}
 
 #[derive(Default)]
 pub struct Monitor {
@@ -75,7 +85,31 @@ pub struct Monitor {
     last_reconcile: Option<Instant>,
     codex_day_dirs: BTreeMap<PathBuf, SystemTime>,
     antigravity_transcripts: BTreeMap<PathBuf, (SystemTime, u64)>,
+    failed_antigravity: BTreeMap<PathBuf, FailedFile>,
+    repair_next_retry: Option<Instant>,
     changes: Arc<Mutex<Changes>>,
+}
+
+#[cfg(unix)]
+fn file_perm_sig(meta: &std::fs::Metadata) -> Option<(u32, i64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.mode(), meta.ctime(), meta.len()))
+}
+
+#[cfg(not(unix))]
+fn file_perm_sig(meta: &std::fs::Metadata) -> Option<(u32, i64, u64)> {
+    Some((u32::from(meta.permissions().readonly()), 0, meta.len()))
+}
+
+enum OpError {
+    Io(anyhow::Error),
+    Db(anyhow::Error),
+}
+
+impl From<rusqlite::Error> for OpError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Db(err.into())
+    }
 }
 
 impl Monitor {
@@ -84,7 +118,7 @@ impl Monitor {
         match std::fs::metadata(root) {
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 self.reset_runtime();
-                return totals(store, id, SourceStatus::Waiting);
+                return totals(store, id, SourceStatus::Waiting, 0, None);
             }
             Err(e) => {
                 self.reset_runtime();
@@ -161,9 +195,11 @@ impl Monitor {
             }
         }
         let mut pending = std::mem::take(&mut *self.changes.lock().unwrap());
-        if id == "antigravity" && store.antigravity_repair_pending()? {
-            repair_antigravity_history(store, root)?;
-        }
+        let now_inst = Instant::now();
+        let mut discovered_transcripts = Vec::new();
+        let mut unreadable_entries = Vec::new();
+        let mut perm_recovered = false;
+
         if id == "codex" {
             // A new rollout is not in the hot-file set yet. Directory mtime changes
             // on creation/rename even if the OS coalesces or drops the file event.
@@ -184,30 +220,119 @@ impl Monitor {
             }
             self.codex_day_dirs = day_dirs;
         } else if id == "antigravity" {
-            // Antigravity writes `<brain>/<conv-id>/.system_generated/logs/transcript.jsonl`.
-            // Checking top-level conversation folders directly catches newly created hidden
-            // log trees and same-second appends even if FSEvents drops nested notifications.
+            let (found, unavail) = discover_antigravity_transcripts(root)?;
+            discovered_transcripts = found;
+            unreadable_entries = unavail;
+
+            let present_set: BTreeSet<PathBuf> = discovered_transcripts
+                .iter()
+                .cloned()
+                .chain(unreadable_entries.iter().map(|(p, _)| p.clone()))
+                .collect();
+            self.failed_antigravity.retain(|p, _| present_set.contains(p));
+
+            for (path, reason) in &unreadable_entries {
+                self.recent.retain(|(_, p)| p != path);
+                let prev = self.failed_antigravity.get(path);
+                let next_retry = prev
+                    .map(|f| {
+                        if now_inst >= f.next_retry {
+                            now_inst + FAILED_RETRY_INTERVAL
+                        } else {
+                            f.next_retry
+                        }
+                    })
+                    .unwrap_or_else(|| now_inst + FAILED_RETRY_INTERVAL);
+                self.failed_antigravity.insert(
+                    path.clone(),
+                    FailedFile {
+                        sig: None,
+                        next_retry,
+                        reason: reason.clone(),
+                    },
+                );
+            }
+
             let mut current = BTreeMap::new();
-            for transcript in discover_antigravity_transcripts(root)? {
-                match std::fs::metadata(&transcript) {
+            for transcript in &discovered_transcripts {
+                match std::fs::metadata(transcript) {
                     Ok(meta) => {
                         let sig = (meta.modified()?, meta.len());
-                        if self.antigravity_transcripts.get(&transcript) != Some(&sig) {
+                        let perm_sig = file_perm_sig(&meta);
+                        if let Some(failed) = self.failed_antigravity.get(transcript) {
+                            let sig_changed = failed.sig != perm_sig;
+                            if sig_changed {
+                                perm_recovered = true;
+                            }
+                            if sig_changed || now_inst >= failed.next_retry {
+                                pending.paths.insert(transcript.clone());
+                            }
+                        } else if self.antigravity_transcripts.get(transcript) != Some(&sig) {
                             pending.paths.insert(transcript.clone());
                         }
-                        current.insert(transcript, sig);
+                        current.insert(transcript.clone(), sig);
                     }
                     Err(e) if e.kind() == ErrorKind::NotFound => continue,
                     Err(e) => {
-                        return Err(e)
-                            .with_context(|| format!("无法读取日志文件 {}", transcript.display()))
+                        self.recent.retain(|(_, p)| p != transcript);
+                        self.failed_antigravity.insert(
+                            transcript.clone(),
+                            FailedFile {
+                                sig: None,
+                                next_retry: now_inst + FAILED_RETRY_INTERVAL,
+                                reason: format!("无法访问日志文件 {}: {e}", transcript.display()),
+                            },
+                        );
                     }
                 }
             }
             self.antigravity_transcripts = current;
         }
-        self.sync(store, id, root, pending, reconcile)?;
-        totals(store, id, SourceStatus::Active)
+
+        if id == "antigravity" && store.antigravity_repair_pending()? {
+            let due = self.repair_next_retry.is_none_or(|t| now_inst >= t);
+            if due || perm_recovered {
+                match repair_antigravity_history_inner(store, root) {
+                    Ok(()) => self.repair_next_retry = None,
+                    Err(OpError::Db(e)) => return Err(e),
+                    Err(OpError::Io(e)) => {
+                        self.repair_next_retry = Some(now_inst + FAILED_RETRY_INTERVAL);
+                        eprintln!("[agent-use] antigravity history repair deferred: {e}");
+                    }
+                }
+            }
+        }
+
+        self.sync(store, id, root, pending, reconcile, now_inst)?;
+
+        if id == "antigravity" {
+            let total_seen = discovered_transcripts.len() + unreadable_entries.len();
+            if total_seen == 0 {
+                return totals(store, id, SourceStatus::Waiting, 0, None);
+            }
+            let unreadable = self.failed_antigravity.len();
+            let readable = total_seen.saturating_sub(unreadable);
+            if readable == 0 && unreadable > 0 {
+                let first_reason = self
+                    .failed_antigravity
+                    .values()
+                    .next()
+                    .map(|f| f.reason.as_str())
+                    .unwrap_or("无读取权限");
+                bail!(
+                    "无法读取任何 Antigravity 日志文件（共 {unreadable} 份不可读）：{first_reason}"
+                );
+            }
+            if unreadable > 0 {
+                let msg = format!(
+                    "有 {unreadable} 份会话日志不可读，当前统计可能遗漏部分用量"
+                );
+                return totals(store, id, SourceStatus::Partial, unreadable, Some(msg));
+            }
+            return totals(store, id, SourceStatus::Active, 0, None);
+        }
+
+        totals(store, id, SourceStatus::Active, 0, None)
     }
 
     fn reset_runtime(&mut self) {
@@ -215,6 +340,8 @@ impl Monitor {
         self.recent.clear();
         self.codex_day_dirs.clear();
         self.antigravity_transcripts.clear();
+        self.failed_antigravity.clear();
+        self.repair_next_retry = None;
         self.last_reconcile = None;
     }
 
@@ -225,6 +352,7 @@ impl Monitor {
         root: &Path,
         pending: Changes,
         reconcile: bool,
+        now_inst: Instant,
     ) -> Result<()> {
         let full = reconcile || pending.all;
         let paths = if full {
@@ -240,19 +368,40 @@ impl Monitor {
 
         let mut db = store.connect()?;
         for path in paths {
-            if let Err(error) = import(&mut db, id, root, &path, &mut self.recent) {
-                self.changes.lock().unwrap().all = true;
-                return Err(error);
+            match import(
+                &mut db,
+                id,
+                root,
+                &path,
+                &mut self.recent,
+                &mut self.failed_antigravity,
+                now_inst,
+            ) {
+                Ok(()) => {}
+                Err(OpError::Db(error)) => {
+                    self.changes.lock().unwrap().all = true;
+                    return Err(error);
+                }
+                Err(OpError::Io(error)) => {
+                    self.changes.lock().unwrap().all = true;
+                    return Err(error);
+                }
             }
         }
         if full {
-            self.last_reconcile = Some(Instant::now());
+            self.last_reconcile = Some(now_inst);
         }
         Ok(())
     }
 }
 
-fn totals(store: &Store, id: &str, status: SourceStatus) -> Result<Usage> {
+fn totals(
+    store: &Store,
+    id: &str,
+    status: SourceStatus,
+    unreadable_files: usize,
+    warning: Option<String>,
+) -> Result<Usage> {
     let db = store.connect()?;
     // Latest step ordering:
     // 1. Exact source timestamp preserving full sub-second precision (at_ns, falling back to at * 1e9 for legacy rows)
@@ -420,15 +569,24 @@ fn totals(store: &Store, id: &str, status: SourceStatus) -> Result<Usage> {
         latest_legacy,
         latest_legacy_tokens,
         status,
+        unreadable_files,
+        warning,
     })
 }
 
-fn discover_antigravity_transcripts(root: &Path) -> Result<Vec<PathBuf>> {
+fn discover_antigravity_transcripts(root: &Path) -> Result<(Vec<PathBuf>, Vec<(PathBuf, String)>)> {
     let mut found = Vec::new();
+    let mut unreadable = Vec::new();
     for entry in std::fs::read_dir(root)
         .with_context(|| format!("无法读取日志目录 {}", root.display()))?
     {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                unreadable.push((root.to_path_buf(), format!("读取目录项失败: {e}")));
+                continue;
+            }
+        };
         let path = entry.path();
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
@@ -439,13 +597,16 @@ fn discover_antigravity_transcripts(root: &Path) -> Result<Vec<PathBuf>> {
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("无法访问日志文件 {}", transcript.display()))
+                unreadable.push((
+                    transcript.clone(),
+                    format!("无法访问日志文件 {}: {e}", transcript.display()),
+                ));
             }
         }
     }
     found.sort();
-    Ok(found)
+    unreadable.sort();
+    Ok((found, unreadable))
 }
 
 fn antigravity_conversation_id(base_root: &Path, path: &Path) -> Option<String> {
@@ -487,10 +648,10 @@ fn antigravity_conversation_id_from_path(base_root: &Path, path: &Path) -> Optio
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LegacyV2Row {
+#[derive(Debug, Clone)]
+struct LegacyDbRow {
     at: i64,
-    at_ns: i64,
+    at_ns: Option<i64>,
     tokens: i64,
     complete: i64,
     input: Option<i64>,
@@ -498,60 +659,166 @@ struct LegacyV2Row {
     output: Option<i64>,
 }
 
-fn antigravity_v2_step_from_event(event: &Value) -> Option<(String, LegacyV2Row)> {
-    if event["type"].as_str()? != "PLANNER_RESPONSE" || event["status"].as_str()? != "DONE" {
-        return None;
-    }
-    let (at, at_ns) = parse_rfc3339(event["created_at"].as_str()?)?;
-    let step = event["step_index"].as_i64().filter(|&n| n >= 0)?;
-    let input = optional_nonneg_i64(event, "input_tokens").ok()?;
-    let cache_read = optional_nonneg_i64(event, "cache_read_tokens").ok()?;
-    let output = optional_nonneg_i64(event, "output_tokens").ok()?;
-    if input.is_none() && cache_read.is_none() && output.is_none() {
-        return None;
-    }
-    let complete = i64::from(input.is_some() && cache_read.is_some() && output.is_some());
-    let tokens = input
-        .unwrap_or(0)
-        .checked_add(cache_read.unwrap_or(0))?
-        .checked_add(output.unwrap_or(0))?;
-    Some((
-        step.to_string(),
-        LegacyV2Row {
-            at,
-            at_ns,
-            tokens,
-            complete,
-            input,
-            cache_read,
-            output,
-        },
-    ))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconStep {
+    at: i64,
+    at_ns: i64,
+    tokens: i64,
+    complete: bool,
+    input: Option<i64>,
+    in_ts: Option<i64>,
+    cache_read: Option<i64>,
+    cr_ts: Option<i64>,
+    output: Option<i64>,
+    out_ts: Option<i64>,
 }
 
-fn upsert_v2_sim(sim: &mut BTreeMap<String, LegacyV2Row>, response: String, row: LegacyV2Row) {
-    match sim.get(&response) {
-        None => {
-            sim.insert(response, row);
+impl ReconStep {
+    fn new(rec: &ParsedRecord) -> Self {
+        Self {
+            at: rec.at,
+            at_ns: rec.at_ns,
+            tokens: rec.tokens,
+            complete: rec.complete,
+            input: rec.input,
+            in_ts: rec.input.map(|_| rec.at_ns),
+            cache_read: rec.cache_read,
+            cr_ts: rec.cache_read.map(|_| rec.at_ns),
+            output: rec.output,
+            out_ts: rec.output.map(|_| rec.at_ns),
         }
-        Some(old) => {
-            let should_replace = row.complete > old.complete
-                || (row.complete == old.complete && row.at_ns >= old.at_ns);
-            if should_replace {
-                sim.insert(response, row);
-            }
+    }
+
+    fn merge(&mut self, rec: &ParsedRecord) {
+        if rec.at_ns < self.at_ns {
+            self.at = rec.at;
+            self.at_ns = rec.at_ns;
         }
+        let (m_in, m_in_ts) = merge_field(self.input, self.in_ts, rec.input, rec.at_ns);
+        let (m_cr, m_cr_ts) = merge_field(self.cache_read, self.cr_ts, rec.cache_read, rec.at_ns);
+        let (m_out, m_out_ts) = merge_field(self.output, self.out_ts, rec.output, rec.at_ns);
+        self.input = m_in;
+        self.in_ts = m_in_ts;
+        self.cache_read = m_cr;
+        self.cr_ts = m_cr_ts;
+        self.output = m_out;
+        self.out_ts = m_out_ts;
+        self.complete = m_in.is_some() && m_cr.is_some() && m_out.is_some();
+        self.tokens = m_in
+            .unwrap_or(0)
+            .saturating_add(m_cr.unwrap_or(0))
+            .saturating_add(m_out.unwrap_or(0));
     }
 }
 
-/// One-shot resumable history repair for Antigravity, decoupled from `Monitor::update` so
-/// platforms disabled before upgrading still repair only their previously collected log scope
-/// without reading post-disable appends or new conversations, and without modifying settings.
+fn load_session_legacy_rows(
+    db: &rusqlite::Connection,
+    session: &str,
+) -> std::result::Result<BTreeMap<String, LegacyDbRow>, OpError> {
+    let mut map = BTreeMap::new();
+    let mut stmt = db.prepare(
+        "SELECT response, at, at_ns, tokens, complete, input_tokens, cache_read_tokens, output_tokens
+         FROM usage
+         WHERE provider='antigravity' AND session=?1 AND legacy=1",
+    )?;
+    let rows = stmt.query_map([session], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+            r.get::<_, Option<i64>>(7)?,
+        ))
+    })?;
+    for row in rows {
+        let (resp, at, at_ns, tokens, complete, input, cache_read, output) = row?;
+        map.insert(
+            resp,
+            LegacyDbRow {
+                at,
+                at_ns,
+                tokens,
+                complete,
+                input,
+                cache_read,
+                output,
+            },
+        );
+    }
+    Ok(map)
+}
+
+/// Checks whether a step stored in the legacy DB has independent per-step corroboration in `recon`.
+/// Any step where DB lacked full breakdown/timestamp evidence (e.g. `7d76bf1` overwriting `300+20`
+/// with partial Dec 1 `100`) returns `false` so uncorroborated fields are never elevated to verified.
+fn step_independently_verified(db_row: &LegacyDbRow, recon: &ReconStep, allow_v0: bool) -> bool {
+    if let Some(db_ns) = db_row.at_ns {
+        recon.at == db_row.at
+            && recon.at_ns == db_ns
+            && recon.complete == (db_row.complete == 1)
+            && recon.tokens == db_row.tokens
+            && recon.input == db_row.input
+            && recon.cache_read == db_row.cache_read
+            && recon.output == db_row.output
+    } else if allow_v0
+        && db_row.input.is_none()
+        && db_row.cache_read.is_none()
+        && db_row.output.is_none()
+    {
+        recon.at == db_row.at && recon.tokens == db_row.tokens
+    } else {
+        false
+    }
+}
+
+fn write_verified_recon_step(
+    tx: &rusqlite::Transaction<'_>,
+    session: &str,
+    response: &str,
+    recon: &ReconStep,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO usage(
+            provider,session,response,at,tokens,at_ns,complete,
+            input_tokens,cache_read_tokens,output_tokens,legacy,
+            input_at_ns,cache_read_at_ns,output_at_ns
+         )
+         VALUES('antigravity',?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11,?12)",
+        params![
+            session,
+            response,
+            recon.at,
+            recon.tokens,
+            recon.at_ns,
+            i64::from(recon.complete),
+            recon.input,
+            recon.cache_read,
+            recon.output,
+            recon.in_ts,
+            recon.cr_ts,
+            recon.out_ts,
+        ],
+    )?;
+    Ok(())
+}
+
+/// One-shot resumable history repair for Antigravity, decoupled from `Monitor::update`.
+/// Database errors propagate with full context; individual log I/O errors are isolated
+/// so remaining sessions finish repairing cleanly while the global marker stays pending.
 pub fn repair_antigravity_history(store: &Store, root: &Path) -> Result<()> {
-    if !store.antigravity_repair_pending()? {
+    repair_antigravity_history_inner(store, root).map_err(|e| match e {
+        OpError::Db(err) | OpError::Io(err) => err,
+    })
+}
+
+fn repair_antigravity_history_inner(store: &Store, root: &Path) -> std::result::Result<(), OpError> {
+    if !store.antigravity_repair_pending().map_err(OpError::Db)? {
         return Ok(());
     }
-    let mut db = store.connect()?;
+    let mut db = store.connect().map_err(|e| OpError::Db(e.into()))?;
     let mut tasks: Vec<(String, String, Option<String>, Option<i64>)> = Vec::new();
     {
         let mut stmt = db.prepare(
@@ -566,31 +833,49 @@ pub fn repair_antigravity_history(store: &Store, root: &Path) -> Result<()> {
         }
     }
 
+    let mut io_errors = Vec::new();
     for (kind, target, fingerprint, max_pos) in tasks {
-        match kind.as_str() {
-            "cursor" => {
-                repair_cursor_task(
-                    &mut db,
-                    root,
-                    &target,
-                    fingerprint.as_deref().unwrap_or(""),
-                    max_pos.unwrap_or(0),
-                )?;
-            }
-            "session" => {
-                repair_session_task(&mut db, root, &target)?;
-            }
+        let res = match kind.as_str() {
+            "cursor" => repair_cursor_task(
+                &mut db,
+                root,
+                &target,
+                fingerprint.as_deref().unwrap_or(""),
+                max_pos.unwrap_or(0),
+            ),
+            "session" => repair_session_task(&mut db, root, &target),
             _ => {
                 db.execute(
                     "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
                     [&target],
                 )?;
+                Ok(())
             }
+        };
+        match res {
+            Ok(()) => {}
+            Err(OpError::Db(err)) => return Err(OpError::Db(err)),
+            Err(OpError::Io(err)) => io_errors.push(err.to_string()),
         }
     }
 
-    store.mark_antigravity_repaired()?;
-    Ok(())
+    let remaining: i64 = db.query_row(
+        "SELECT COUNT(*) FROM antigravity_repair_tasks WHERE done=0",
+        [],
+        |r| r.get(0),
+    )?;
+    if remaining == 0 && io_errors.is_empty() {
+        store.mark_antigravity_repaired().map_err(OpError::Db)?;
+        return Ok(());
+    }
+    Err(OpError::Io(anyhow::anyhow!(
+        "{}",
+        if io_errors.is_empty() {
+            "仍有未完成的 Antigravity 修复任务".to_string()
+        } else {
+            io_errors.join("; ")
+        }
+    )))
 }
 
 fn repair_cursor_task(
@@ -599,7 +884,7 @@ fn repair_cursor_task(
     target: &str,
     expected_fp: &str,
     raw_max_pos: i64,
-) -> Result<()> {
+) -> std::result::Result<(), OpError> {
     let max_pos = match u64::try_from(raw_max_pos) {
         Ok(p) => p,
         Err(_) => {
@@ -614,7 +899,6 @@ fn repair_cursor_task(
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            // Source file deleted: preserve existing DB rows as legacy unverified and finish task.
             db.execute(
                 "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
                 [target],
@@ -622,11 +906,13 @@ fn repair_cursor_task(
             return Ok(());
         }
         Err(e) => {
-            return Err(e).with_context(|| format!("修复历史时无法访问日志文件 {}", path.display()))
+            return Err(OpError::Io(
+                anyhow::Error::new(e)
+                    .context(format!("修复历史时无法访问日志文件 {}", path.display())),
+            ));
         }
     };
     if expected_fp.is_empty() || file_id(&meta) != expected_fp || meta.len() < max_pos {
-        // File identity changed or file shrank: cannot prove previously collected prefix.
         db.execute(
             "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
             [target],
@@ -643,10 +929,16 @@ fn repair_cursor_task(
             return Ok(());
         }
         Err(e) => {
-            return Err(e).with_context(|| format!("修复历史时无法打开日志文件 {}", path.display()))
+            return Err(OpError::Io(
+                anyhow::Error::new(e)
+                    .context(format!("修复历史时无法打开日志文件 {}", path.display())),
+            ));
         }
     };
-    if file_id(&file.metadata()?) != expected_fp {
+    let opened_fp = file
+        .metadata()
+        .map_err(|e| OpError::Io(e.into()))?;
+    if file_id(&opened_fp) != expected_fp {
         db.execute(
             "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
             [target],
@@ -661,32 +953,59 @@ fn repair_cursor_task(
         return Ok(());
     };
 
+    let legacy_rows = load_session_legacy_rows(db, &conv_id)?;
+    if legacy_rows.is_empty() {
+        db.execute(
+            "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
+            [target],
+        )?;
+        return Ok(());
+    }
+
     let mut reader = BufReader::new(file.take(max_pos));
-    let mut records = Vec::new();
+    let mut recon_map: BTreeMap<String, ReconStep> = BTreeMap::new();
     let mut bytes = Vec::new();
     let mut read_pos = 0u64;
     loop {
         bytes.clear();
-        let len = reader.read_until(b'\n', &mut bytes)?;
+        let len = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|e| OpError::Io(e.into()))?;
         if len == 0 || bytes.last() != Some(&b'\n') {
             break;
         }
         read_pos += len as u64;
         if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(rec) = record("antigravity", Some(&conv_id), &event) {
-                records.push(rec);
+                recon_map
+                    .entry(rec.response.clone())
+                    .and_modify(|s| s.merge(&rec))
+                    .or_insert_with(|| ReconStep::new(&rec));
             }
         }
     }
 
-    let tx = db.transaction()?;
-    for rec in &records {
-        upsert_antigravity_record(&tx, rec)?;
+    let mut verified_steps = Vec::new();
+    for (resp, db_row) in &legacy_rows {
+        if let Some(recon) = recon_map.get(resp) {
+            if step_independently_verified(db_row, recon, true) {
+                verified_steps.push((resp.as_str(), recon));
+            }
+        }
     }
-    tx.execute(
-        "INSERT OR REPLACE INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
-        params![target, expected_fp, i64::try_from(read_pos)?],
-    )?;
+    let all_verified = verified_steps.len() == legacy_rows.len();
+
+    let tx = db.transaction()?;
+    for (resp, recon) in verified_steps {
+        write_verified_recon_step(&tx, &conv_id, resp, recon)?;
+    }
+    if all_verified {
+        let pos_i64 = i64::try_from(read_pos).map_err(|e| OpError::Io(e.into()))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+            params![target, expected_fp, pos_i64],
+        )?;
+    }
     tx.execute(
         "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
         [target],
@@ -695,49 +1014,41 @@ fn repair_cursor_task(
     Ok(())
 }
 
-fn repair_session_task(db: &mut rusqlite::Connection, root: &Path, session: &str) -> Result<()> {
-    let mut legacy_map: BTreeMap<String, LegacyV2Row> = BTreeMap::new();
-    let mut all_have_ns = true;
-    {
-        let mut stmt = db.prepare(
-            "SELECT response, at, at_ns, tokens, complete, input_tokens, cache_read_tokens, output_tokens
-             FROM usage
-             WHERE provider='antigravity' AND session=?1 AND legacy=1",
-        )?;
-        let rows = stmt.query_map([session], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-                r.get::<_, Option<i64>>(7)?,
-            ))
-        })?;
-        for row in rows {
-            let (resp, at, at_ns_opt, tokens, complete, inp, cr, out) = row?;
-            let Some(at_ns) = at_ns_opt else {
-                all_have_ns = false;
-                break;
-            };
-            legacy_map.insert(
-                resp,
-                LegacyV2Row {
-                    at,
-                    at_ns,
-                    tokens,
-                    complete,
-                    input: inp,
-                    cache_read: cr,
-                    output: out,
-                },
-            );
+#[derive(Default)]
+struct StepMatchTracker {
+    matched: Option<(u64, ReconStep)>,
+    diverged_after_match: bool,
+    ambiguous: bool,
+}
+
+impl StepMatchTracker {
+    fn observe(&mut self, byte_pos: u64, db_row: &LegacyDbRow, recon: &ReconStep) {
+        if self.ambiguous {
+            return;
+        }
+        let is_match = step_independently_verified(db_row, recon, false);
+        match (&self.matched, is_match) {
+            (None, true) => {
+                self.matched = Some((byte_pos, recon.clone()));
+            }
+            (Some(_), false) if !self.diverged_after_match => {
+                self.diverged_after_match = true;
+            }
+            (Some(_), true) if self.diverged_after_match => {
+                self.ambiguous = true;
+            }
+            _ => {}
         }
     }
+}
 
-    if !all_have_ns || legacy_map.is_empty() {
+fn repair_session_task(
+    db: &mut rusqlite::Connection,
+    root: &Path,
+    session: &str,
+) -> std::result::Result<(), OpError> {
+    let legacy_rows = load_session_legacy_rows(db, session)?;
+    if legacy_rows.is_empty() {
         db.execute(
             "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
             [session],
@@ -758,58 +1069,68 @@ fn repair_session_task(db: &mut rusqlite::Connection, root: &Path, session: &str
             return Ok(());
         }
         Err(e) => {
-            return Err(e).with_context(|| format!("修复历史时无法打开日志文件 {}", path.display()))
+            return Err(OpError::Io(
+                anyhow::Error::new(e)
+                    .context(format!("修复历史时无法打开日志文件 {}", path.display())),
+            ));
         }
     };
-    let fp = file_id(&file.metadata()?);
+    let fp = file_id(&file.metadata().map_err(|e| OpError::Io(e.into()))?);
     let mut reader = BufReader::new(file);
-    let mut sim_v2: BTreeMap<String, LegacyV2Row> = BTreeMap::new();
-    let mut collected: Vec<(u64, ParsedRecord)> = Vec::new();
+    let mut recon_map: BTreeMap<String, ReconStep> = BTreeMap::new();
+    let mut trackers: BTreeMap<String, StepMatchTracker> = legacy_rows
+        .keys()
+        .map(|k| (k.clone(), StepMatchTracker::default()))
+        .collect();
     let mut bytes = Vec::new();
     let mut byte_pos = 0u64;
-    let mut matched_pos: Option<u64> = None;
-    let mut diverged_after_match = false;
-    let mut ambiguous = false;
 
     loop {
         bytes.clear();
-        let len = reader.read_until(b'\n', &mut bytes)?;
+        let len = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|e| OpError::Io(e.into()))?;
         if len == 0 || bytes.last() != Some(&b'\n') {
             break;
         }
         byte_pos += len as u64;
         if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(rec) = record("antigravity", Some(session), &event) {
-                collected.push((byte_pos, rec));
+                let resp = rec.response.clone();
+                let recon = recon_map
+                    .entry(resp.clone())
+                    .and_modify(|s| s.merge(&rec))
+                    .or_insert_with(|| ReconStep::new(&rec));
+                if let (Some(db_row), Some(tracker)) =
+                    (legacy_rows.get(&resp), trackers.get_mut(&resp))
+                {
+                    tracker.observe(byte_pos, db_row, recon);
+                }
             }
-            if let Some((resp, v2_row)) = antigravity_v2_step_from_event(&event) {
-                upsert_v2_sim(&mut sim_v2, resp, v2_row);
-            }
-        }
-        if matched_pos.is_none() {
-            if sim_v2 == legacy_map {
-                matched_pos = Some(byte_pos);
-            }
-        } else if !diverged_after_match {
-            if sim_v2 != legacy_map {
-                diverged_after_match = true;
-            }
-        } else if sim_v2 == legacy_map {
-            ambiguous = true;
-            break;
         }
     }
 
-    let tx = db.transaction()?;
-    if let Some(proven_pos) = matched_pos.filter(|_| !ambiguous) {
-        for (pos, rec) in &collected {
-            if *pos <= proven_pos {
-                upsert_antigravity_record(&tx, rec)?;
+    let mut verified_steps = Vec::new();
+    let mut max_verified_pos = 0u64;
+    for (resp, tracker) in &trackers {
+        if !tracker.ambiguous {
+            if let Some((pos, recon)) = &tracker.matched {
+                max_verified_pos = max_verified_pos.max(*pos);
+                verified_steps.push((resp.as_str(), recon));
             }
         }
+    }
+    let all_verified = verified_steps.len() == legacy_rows.len();
+
+    let tx = db.transaction()?;
+    for (resp, recon) in verified_steps {
+        write_verified_recon_step(&tx, session, resp, recon)?;
+    }
+    if all_verified {
+        let pos_i64 = i64::try_from(max_verified_pos).map_err(|e| OpError::Io(e.into()))?;
         tx.execute(
             "INSERT OR REPLACE INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
-            params![path.to_string_lossy(), fp, i64::try_from(proven_pos)?],
+            params![path.to_string_lossy(), fp, pos_i64],
         )?;
     }
     tx.execute(
@@ -820,19 +1141,70 @@ fn repair_session_task(db: &mut rusqlite::Connection, root: &Path, session: &str
     Ok(())
 }
 
+fn antigravity_file_pending_repair(
+    db: &rusqlite::Connection,
+    file_path: &Path,
+    conv_id: Option<&str>,
+) -> Result<bool> {
+    let key = file_path.to_string_lossy();
+    let by_path: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM antigravity_repair_tasks WHERE kind='cursor' AND target=?1 AND done=0)",
+        [key.as_ref()],
+        |r| r.get(0),
+    )?;
+    if by_path {
+        return Ok(true);
+    }
+    if let Some(session) = conv_id {
+        let by_session: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM antigravity_repair_tasks WHERE kind='session' AND target=?1 AND done=0)",
+            [session],
+            |r| r.get(0),
+        )?;
+        if by_session {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn import(
     db: &mut rusqlite::Connection,
     id: &str,
     base_root: &Path,
     target: &Path,
     recent: &mut BTreeSet<(SystemTime, PathBuf)>,
-) -> Result<()> {
+    failed_antigravity: &mut BTreeMap<PathBuf, FailedFile>,
+    now_inst: Instant,
+) -> std::result::Result<(), OpError> {
     if !target.exists() {
         return Ok(());
     }
     if id == "antigravity" {
         let files = if target == base_root {
-            discover_antigravity_transcripts(base_root)?
+            let (found, unavail) = discover_antigravity_transcripts(base_root).map_err(OpError::Io)?;
+            for (path, reason) in unavail {
+                recent.retain(|(_, p)| p != &path);
+                let prev = failed_antigravity.get(&path);
+                let next_retry = prev
+                    .map(|f| {
+                        if now_inst >= f.next_retry {
+                            now_inst + FAILED_RETRY_INTERVAL
+                        } else {
+                            f.next_retry
+                        }
+                    })
+                    .unwrap_or_else(|| now_inst + FAILED_RETRY_INTERVAL);
+                failed_antigravity.insert(
+                    path,
+                    FailedFile {
+                        sig: None,
+                        next_retry,
+                        reason,
+                    },
+                );
+            }
+            found
         } else if antigravity_conversation_id(base_root, target).is_some() {
             vec![target.to_path_buf()]
         } else if target.is_dir() {
@@ -858,13 +1230,57 @@ fn import(
         };
         for file_path in files {
             let conv_id = antigravity_conversation_id(base_root, &file_path);
-            import_file(db, id, &file_path, conv_id.as_deref(), recent)?;
+            if let Some(failed) = failed_antigravity.get(&file_path) {
+                let current_sig = std::fs::metadata(&file_path)
+                    .ok()
+                    .and_then(|m| file_perm_sig(&m));
+                if current_sig == failed.sig && now_inst < failed.next_retry {
+                    continue;
+                }
+            }
+            if antigravity_file_pending_repair(db, &file_path, conv_id.as_deref())
+                .map_err(OpError::Db)?
+            {
+                recent.retain(|(_, p)| p != &file_path);
+                let current_sig = std::fs::metadata(&file_path)
+                    .ok()
+                    .and_then(|m| file_perm_sig(&m));
+                failed_antigravity.insert(
+                    file_path,
+                    FailedFile {
+                        sig: current_sig,
+                        next_retry: now_inst + FAILED_RETRY_INTERVAL,
+                        reason: "等待历史修复完成".to_string(),
+                    },
+                );
+                continue;
+            }
+            match import_file(db, id, &file_path, conv_id.as_deref(), recent) {
+                Ok(()) => {
+                    failed_antigravity.remove(&file_path);
+                }
+                Err(OpError::Db(err)) => return Err(OpError::Db(err)),
+                Err(OpError::Io(err)) => {
+                    recent.retain(|(_, p)| p != &file_path);
+                    let sig = std::fs::metadata(&file_path)
+                        .ok()
+                        .and_then(|m| file_perm_sig(&m));
+                    failed_antigravity.insert(
+                        file_path,
+                        FailedFile {
+                            sig,
+                            next_retry: now_inst + FAILED_RETRY_INTERVAL,
+                            reason: err.to_string(),
+                        },
+                    );
+                }
+            }
         }
         return Ok(());
     }
 
     for entry in WalkDir::new(target) {
-        let entry = entry?;
+        let entry = entry.map_err(|e| OpError::Io(e.into()))?;
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl")
         {
@@ -1009,13 +1425,17 @@ fn import_file(
     path: &Path,
     session_fallback: Option<&str>,
     recent: &mut BTreeSet<(SystemTime, PathBuf)>,
-) -> Result<()> {
+) -> std::result::Result<(), OpError> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("无法读取日志文件 {}", path.display())),
+        Err(e) => {
+            return Err(OpError::Io(
+                anyhow::Error::new(e).context(format!("无法读取日志文件 {}", path.display())),
+            ));
+        }
     };
-    let modified = meta.modified()?;
+    let modified = meta.modified().map_err(|e| OpError::Io(e.into()))?;
     if recent.len() < HOT_LOG_LIMIT
         || recent
             .first()
@@ -1045,18 +1465,27 @@ fn import_file(
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("无法打开日志文件 {}", path.display())),
+        Err(e) => {
+            return Err(OpError::Io(
+                anyhow::Error::new(e).context(format!("无法打开日志文件 {}", path.display())),
+            ));
+        }
     };
-    if file_id(&file.metadata()?) != fingerprint {
+    let opened_meta = file.metadata().map_err(|e| OpError::Io(e.into()))?;
+    if file_id(&opened_meta) != fingerprint {
         return Ok(());
     }
     let mut reader = BufReader::new(file);
-    reader.seek(SeekFrom::Start(pos))?;
+    reader
+        .seek(SeekFrom::Start(pos))
+        .map_err(|e| OpError::Io(e.into()))?;
     let tx = db.transaction()?;
     let mut bytes = Vec::new();
     loop {
         bytes.clear();
-        let len = reader.read_until(b'\n', &mut bytes)?;
+        let len = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|e| OpError::Io(e.into()))?;
         if len == 0 || bytes.last() != Some(&b'\n') {
             break;
         }
@@ -1064,7 +1493,7 @@ fn import_file(
         if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(rec) = record(id, session_fallback, &event) {
                 if id == "antigravity" {
-                    upsert_antigravity_record(&tx, &rec)?;
+                    upsert_antigravity_record(&tx, &rec).map_err(OpError::Db)?;
                 } else {
                     tx.execute(
                         "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
@@ -1097,9 +1526,10 @@ fn import_file(
             }
         }
     }
+    let pos_i64 = i64::try_from(pos).map_err(|e| OpError::Io(e.into()))?;
     tx.execute(
         "INSERT OR REPLACE INTO cursors VALUES(?1,?2,?3,?4)",
-        params![id, key, fingerprint, i64::try_from(pos)?],
+        params![id, key, fingerprint, pos_i64],
     )?;
     tx.commit()?;
     Ok(())
@@ -1264,6 +1694,70 @@ mod tests {
         let usage = monitor.update(&store, "codex", &root)?;
         assert_eq!(usage.today, Some(59730));
         assert_eq!(usage.latest, Some(1));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_persistent_permission_error_throttles_full_rescans() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("throttle.sqlite"))?;
+        store.settings(false, || {
+            vec![Agent {
+                id: "antigravity".into(),
+                name: "Antigravity".into(),
+                binary: None,
+                status: "installed".into(),
+            }]
+        })?;
+        store.select(vec!["antigravity".into()])?;
+
+        let brain = dir.path().join("brain");
+        let la = brain.join("conv-a/.system_generated/logs");
+        let lz = brain.join("conv-z/.system_generated/logs");
+        fs::create_dir_all(&la)?;
+        fs::create_dir_all(&lz)?;
+        let ta = la.join("transcript.jsonl");
+        let tz = lz.join("transcript.jsonl");
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        fs::write(
+            &ta,
+            format!(
+                "{}\n",
+                json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": format!("{today}T09:00:00+08:00"), "input_tokens": 50, "cache_read_tokens": 25, "output_tokens": 25})
+            ),
+        )?;
+        fs::write(
+            &tz,
+            format!(
+                "{}\n",
+                json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": format!("{today}T10:00:00+08:00"), "input_tokens": 200, "cache_read_tokens": 12, "output_tokens": 10})
+            ),
+        )?;
+        let orig = fs::metadata(&ta)?.permissions();
+        fs::set_permissions(&ta, fs::Permissions::from_mode(0o000))?;
+
+        let mut mon = Monitor::default();
+        let u1 = mon.update(&store, "antigravity", &brain)?;
+        assert_eq!(u1.status, SourceStatus::Partial);
+        assert_eq!(u1.unreadable_files, 1);
+        let first_reconcile = mon.last_reconcile.expect("reconcile stamp should stay set");
+        assert!(!mon.changes.lock().unwrap().all, "must not force full rescan on every poll");
+        assert!(mon.failed_antigravity.contains_key(&ta));
+
+        // Second poll within retry window reuses cached failed entry without full rescan or opening ta.
+        let u2 = mon.update(&store, "antigravity", &brain)?;
+        assert_eq!(u2.status, SourceStatus::Partial);
+        assert_eq!(mon.last_reconcile, Some(first_reconcile));
+        assert!(!mon.changes.lock().unwrap().all);
+
+        // Restoring permission updates perm signature -> immediate catch-up on very next poll!
+        fs::set_permissions(&ta, orig)?;
+        let u3 = mon.update(&store, "antigravity", &brain)?;
+        assert_eq!(u3.status, SourceStatus::Active);
+        assert_eq!(u3.today, Some(322));
+        assert!(mon.failed_antigravity.is_empty());
         Ok(())
     }
 }

@@ -29,12 +29,8 @@ impl Granularity {
     }
 
     pub fn page_size(self) -> usize {
-        match self {
-            Self::Day => 30,
-            Self::Week => 12,
-            Self::Month => 12,
-            Self::Year => 5,
-        }
+        let _ = self;
+        1
     }
 }
 
@@ -89,6 +85,8 @@ pub struct HistorySummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryPage {
     pub granularity: Granularity,
+    pub bucket_granularity: Granularity,
+    pub is_current: bool,
     pub offset: u32,
     pub provider: Option<String>,
     pub range_start: String,
@@ -331,94 +329,29 @@ fn build_specs<Tz: TimeZone>(
         };
     }
 
-    let count = granularity.page_size();
     match granularity {
         Granularity::Day => {
-            let end = today - Duration::days(i64::from(offset) * count as i64);
-            let start = end - Duration::days(count as i64 - 1);
-            build_day_specs(start, end, today, tz)
+            let day = today - Duration::days(i64::from(offset));
+            build_day_specs(day, day, today, tz)
         }
         Granularity::Week => {
-            let current_mon = week_monday(today);
-            let end_mon = current_mon - Duration::days(i64::from(offset) * count as i64 * 7);
-            let start_mon = end_mon - Duration::days((count as i64 - 1) * 7);
-            let mut specs = Vec::with_capacity(count);
-            for i in 0..count {
-                let mon = start_mon + Duration::days(i as i64 * 7);
-                let sun = mon + Duration::days(6);
-                let is_current = today >= mon && today <= sun;
-                let display_end = if is_current && sun > today { today } else { sun };
-                let exclusive_end = display_end.succ_opt().context("日期溢出")?;
-                let same_year = mon.year() == display_end.year();
-                let label = if same_year {
-                    format!("{} – {}", mon.format("%m/%d"), display_end.format("%m/%d"))
-                } else {
-                    format!(
-                        "{} – {}",
-                        mon.format("%Y/%m/%d"),
-                        display_end.format("%Y/%m/%d")
-                    )
-                };
-                specs.push(BucketSpec {
-                    key: format!(
-                        "{}..{}",
-                        mon.format("%Y-%m-%d"),
-                        sun.format("%Y-%m-%d")
-                    ),
-                    label,
-                    start_date: mon,
-                    end_date: display_end,
-                    start_sec: local_day_start_sec(mon, tz)?,
-                    end_sec: local_day_start_sec(exclusive_end, tz)?,
-                    is_current,
-                });
-            }
-            Ok(specs)
+            let mon = week_monday(today) - Duration::days(i64::from(offset) * 7);
+            let sun = mon + Duration::days(6);
+            let end = if offset == 0 && sun > today { today } else { sun };
+            build_day_specs(mon, end, today, tz)
         }
         Granularity::Month => {
-            let (end_y, end_m) =
-                shift_months(today.year(), today.month(), -(offset as i32 * count as i32))?;
-            let (start_y, start_m) = shift_months(end_y, end_m, -(count as i32 - 1))?;
-            let mut specs = Vec::with_capacity(count);
-            for i in 0..count {
-                let (y, m) = shift_months(start_y, start_m, i as i32)?;
-                let (start, end, _) = month_bounds(y, m)?;
-                let is_current = today >= start && today <= end;
-                let display_end = if is_current && end > today { today } else { end };
-                let exclusive_end = display_end.succ_opt().context("日期溢出")?;
-                specs.push(BucketSpec {
-                    key: format!("{y:04}-{m:02}"),
-                    label: format!("{y}年{m}月"),
-                    start_date: start,
-                    end_date: display_end,
-                    start_sec: local_day_start_sec(start, tz)?,
-                    end_sec: local_day_start_sec(exclusive_end, tz)?,
-                    is_current,
-                });
-            }
-            Ok(specs)
+            let (y, m) = shift_months(today.year(), today.month(), -(offset as i32))?;
+            let (start, end, _) = month_bounds(y, m)?;
+            let clamped_end = if offset == 0 && end > today { today } else { end };
+            build_day_specs(start, clamped_end, today, tz)
         }
         Granularity::Year => {
-            let end_y = today.year() - (offset as i32 * count as i32);
-            let start_y = end_y - (count as i32 - 1);
-            let mut specs = Vec::with_capacity(count);
-            for y in start_y..=end_y {
-                let start = NaiveDate::from_ymd_opt(y, 1, 1).context("无效年份")?;
-                let end = NaiveDate::from_ymd_opt(y, 12, 31).context("无效年末")?;
-                let is_current = today.year() == y;
-                let display_end = if is_current && end > today { today } else { end };
-                let exclusive_end = display_end.succ_opt().context("日期溢出")?;
-                specs.push(BucketSpec {
-                    key: format!("{y:04}"),
-                    label: format!("{y}年"),
-                    start_date: start,
-                    end_date: display_end,
-                    start_sec: local_day_start_sec(start, tz)?,
-                    end_sec: local_day_start_sec(exclusive_end, tz)?,
-                    is_current,
-                });
-            }
-            Ok(specs)
+            let y = today.year() - (offset as i32);
+            let start = NaiveDate::from_ymd_opt(y, 1, 1).context("无效年份")?;
+            let end = NaiveDate::from_ymd_opt(y, 12, 31).context("无效年末")?;
+            let clamped_end = if offset == 0 && end > today { today } else { end };
+            build_month_specs_range(start, clamped_end, today, tz)
         }
     }
 }
@@ -756,8 +689,15 @@ fn query_page_on_tx<Tz: TimeZone>(
             .collect(),
     };
 
+    let bucket_granularity = match granularity {
+        Granularity::Year => Granularity::Month,
+        _ => Granularity::Day,
+    };
+
     Ok(HistoryPage {
         granularity,
+        bucket_granularity,
+        is_current: !is_drilldown && offset == 0,
         offset,
         provider: filter.map(String::from),
         range_start: first_start.format("%Y-%m-%d").to_string(),
@@ -807,14 +747,14 @@ mod tests {
         let mut injected = false;
         let page1 = query_with_tz_and_drill_with_hook(
             &store,
-            Granularity::Week,
+            Granularity::Year,
             0,
             None,
             None,
             None,
             today,
             &tz,
-            Some("2026-11-23..2026-11-29"),
+            Some("2026-11"),
             || {
                 if !injected {
                     injected = true;
@@ -834,35 +774,29 @@ mod tests {
             },
         )?;
 
-        let parent_week = page1
-            .buckets
-            .iter()
-            .find(|b| b.key == "2026-11-23..2026-11-29")
-            .unwrap();
+        let parent_nov = page1.buckets.iter().find(|b| b.key == "2026-11").unwrap();
         let drill1 = page1.drill.as_ref().unwrap();
-        // Same snapshot: BOTH parent (300) and drill (300) see pre-write state, never 300 vs 550.
-        assert_eq!(parent_week.verified_tokens, Some(300));
+        // Same snapshot: summary (300), monthly bucket (300), and daily drill (300) agree under concurrent write.
+        assert_eq!(page1.summary.verified_tokens, Some(300));
+        assert_eq!(parent_nov.verified_tokens, Some(300));
         assert_eq!(drill1.summary.verified_tokens, Some(300));
 
-        // Subsequent query sees 550 in BOTH parent and drill.
+        // Subsequent query sees 550 everywhere atomically.
         let page2 = query_with_tz_and_drill(
             &store,
-            Granularity::Week,
+            Granularity::Year,
             0,
             None,
             None,
             None,
             today,
             &tz,
-            Some("2026-11-23..2026-11-29"),
+            Some("2026-11"),
         )?;
-        let parent_week2 = page2
-            .buckets
-            .iter()
-            .find(|b| b.key == "2026-11-23..2026-11-29")
-            .unwrap();
+        let parent_nov2 = page2.buckets.iter().find(|b| b.key == "2026-11").unwrap();
         let drill2 = page2.drill.as_ref().unwrap();
-        assert_eq!(parent_week2.verified_tokens, Some(550));
+        assert_eq!(page2.summary.verified_tokens, Some(550));
+        assert_eq!(parent_nov2.verified_tokens, Some(550));
         assert_eq!(drill2.summary.verified_tokens, Some(550));
         Ok(())
     }

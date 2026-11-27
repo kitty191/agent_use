@@ -13,8 +13,8 @@ pub struct Settings {
     pub enabled: Vec<String>,
     pub confirmed: bool,
 }
-const CURRENT_SCHEMA_VERSION: i32 = 4;
-pub const ANTIGRAVITY_REPAIR_VERSION: i32 = 4;
+const CURRENT_SCHEMA_VERSION: i32 = 5;
+pub const ANTIGRAVITY_REPAIR_VERSION: i32 = 5;
 const ANTIGRAVITY_REPAIR_KEY: &str = "antigravity_repair_version";
 
 impl Store {
@@ -59,7 +59,7 @@ impl Store {
     pub fn connect(&self) -> Result<Connection> {
         Ok(Connection::open(&self.path)?)
     }
-    pub fn antigravity_repair_pending(&self) -> Result<bool> {
+    pub fn antigravity_repair_version(&self) -> Result<i32> {
         let ver: Option<String> = self
             .connect()?
             .query_row(
@@ -68,8 +68,10 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        let parsed = ver.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-        Ok(parsed < ANTIGRAVITY_REPAIR_VERSION)
+        Ok(ver.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0))
+    }
+    pub fn antigravity_repair_pending(&self) -> Result<bool> {
+        Ok(self.antigravity_repair_version()? < ANTIGRAVITY_REPAIR_VERSION)
     }
     pub fn mark_antigravity_repaired(&self) -> Result<()> {
         let mut db = self.connect()?;
@@ -228,7 +230,7 @@ fn migrate_usage_schema(db: &mut Connection) -> Result<()> {
     }
 
     if version < 3 {
-        // Detect pre-v3 databases (both v0 and v2 from 7d76bf1) that already hold Antigravity rows or cursors.
+        // Detect pre-v3 databases (v0, 7d76bf1 v2, 7b1ecd9 v2) that already hold Antigravity rows or cursors.
         let has_antigravity_data: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM usage WHERE provider='antigravity')
                  OR EXISTS(SELECT 1 FROM cursors WHERE provider='antigravity')",
@@ -252,7 +254,7 @@ fn migrate_usage_schema(db: &mut Connection) -> Result<()> {
             )?;
             tx.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
-                rusqlite::params![ANTIGRAVITY_REPAIR_KEY, "3"],
+                rusqlite::params![ANTIGRAVITY_REPAIR_KEY, "4"],
             )?;
         } else {
             tx.execute(
@@ -292,7 +294,7 @@ fn migrate_usage_schema(db: &mut Connection) -> Result<()> {
                 )?;
                 tx.execute(
                     "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
-                    rusqlite::params![ANTIGRAVITY_REPAIR_KEY, "3"],
+                    rusqlite::params![ANTIGRAVITY_REPAIR_KEY, "4"],
                 )?;
             } else {
                 tx.execute(
@@ -301,6 +303,48 @@ fn migrate_usage_schema(db: &mut Connection) -> Result<()> {
                 )?;
             }
         }
+    } else if version == 4 {
+        // v4 DB from 02c6166:
+        // Keep any unfinished tasks intact, and re-queue sessions left purely `legacy=1`
+        // (such as `7b1ecd9 -> 969f12a -> 02c6166` where 02c6166 only knew 7d76bf1 rules).
+        // Sessions already containing `legacy=0` rows are left untouched to avoid deleting user history
+        // without provenance.
+        tx.execute(
+            "INSERT OR IGNORE INTO antigravity_repair_tasks(kind, target, fingerprint, max_pos, done)
+             SELECT DISTINCT 'session', u.session, NULL, NULL, 0
+             FROM usage u
+             WHERE u.provider='antigravity' AND u.legacy=1
+               AND NOT EXISTS(
+                   SELECT 1 FROM usage u2
+                   WHERE u2.provider='antigravity' AND u2.session=u.session AND u2.legacy=0
+               )
+               AND NOT EXISTS(
+                   SELECT 1 FROM antigravity_repair_tasks t
+                   WHERE t.done=0
+                     AND (
+                         (t.kind='session' AND t.target=u.session)
+                         OR (t.kind='cursor' AND (
+                             t.target LIKE '%/' || u.session || '/.system_generated/logs/transcript.jsonl'
+                             OR t.target LIKE '%\\' || u.session || '\\.system_generated\\logs\\transcript.jsonl'
+                         ))
+                     )
+               )",
+            [],
+        )?;
+        let has_pending_tasks: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM antigravity_repair_tasks WHERE done=0)",
+            [],
+            |r| r.get(0),
+        )?;
+        let target_ver = if has_pending_tasks {
+            "4".to_string()
+        } else {
+            ANTIGRAVITY_REPAIR_VERSION.to_string()
+        };
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+            rusqlite::params![ANTIGRAVITY_REPAIR_KEY, target_ver],
+        )?;
     }
     tx.execute_batch(&format!("PRAGMA user_version={CURRENT_SCHEMA_VERSION};"))?;
     tx.commit()?;

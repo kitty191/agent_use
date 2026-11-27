@@ -6,7 +6,7 @@ import "./style.css";
 
 type Agent = { id: string; name: string; status: string };
 type Settings = { agents: Agent[]; enabled: string[]; confirmed: boolean };
-type SourceStatus = "active" | "waiting";
+type SourceStatus = "active" | "partial" | "waiting";
 type Usage = {
   today: number | null;
   today_complete_steps: number;
@@ -22,6 +22,8 @@ type Usage = {
   latest_legacy: boolean;
   latest_legacy_tokens: number | null;
   status: SourceStatus;
+  unreadable_files?: number;
+  warning?: string | null;
 };
 type WindowData = {
   pool: string;
@@ -37,7 +39,7 @@ type Quota = {
 };
 type ThemeMode = "system" | "light" | "dark";
 type ViewMode = "overview" | "history" | "settings";
-type UsageReadState = "loading" | "active" | "waiting" | "error";
+type UsageReadState = "loading" | "active" | "partial" | "waiting" | "error";
 type PendingAction = "idle" | "initial" | "rescan" | "save";
 
 const USAGE_PROVIDERS = new Set(["codex", "claude", "antigravity"]);
@@ -400,7 +402,11 @@ function UsagePanel({
           setErr("");
           onStatusChange?.(
             agent.id,
-            u.status === "active" ? "active" : "waiting",
+            u.status === "active"
+              ? "active"
+              : u.status === "partial"
+                ? "partial"
+                : "waiting",
           );
         }
       } catch (e) {
@@ -525,7 +531,15 @@ function UsagePanel({
               来源：Antigravity 本机对话日志（按本地日期统计已完成模型步骤；仅含本机已记录用量，账号、模型池、剩余额度与重置时间暂不可查）。
             </p>
           )}
-          <footer className={err ? "card-footer footer-error" : "card-footer"}>
+          <footer
+            className={
+              err
+                ? "card-footer footer-error"
+                : usage?.status === "partial"
+                  ? "card-footer footer-warn"
+                  : "card-footer"
+            }
+          >
             <ClockIcon />
             <span>
               {err
@@ -536,12 +550,19 @@ function UsagePanel({
                       (agent.id === "antigravity" ? "步骤 " : "用量 ") +
                       formatTime(usage.latest_at)
                     : "等待首次对话记录"
-                  : usage?.latest_at
-                    ? (agent.id === "antigravity" ? "最近步骤 " : "最近用量 ") +
-                      formatTime(usage.latest_at)
-                    : usage
-                      ? "尚未读到用量记录"
-                      : "读取本地记录中…"}
+                  : usage?.status === "partial"
+                    ? (usage.warning ?? "部分会话日志不可读，当前统计可能遗漏部分用量") +
+                      (usage.latest_at
+                        ? " · 最近" +
+                          (agent.id === "antigravity" ? "步骤 " : "用量 ") +
+                          formatTime(usage.latest_at)
+                        : "")
+                    : usage?.latest_at
+                      ? (agent.id === "antigravity" ? "最近步骤 " : "最近用量 ") +
+                        formatTime(usage.latest_at)
+                      : usage
+                        ? "尚未读到用量记录"
+                        : "读取本地记录中…"}
             </span>
           </footer>
         </>
@@ -661,6 +682,9 @@ function App() {
   const activeCollectors = usageChosen.filter(
     (a) => usageStates[a.id] === "active",
   );
+  const partialCollectors = usageChosen.filter(
+    (a) => usageStates[a.id] === "partial",
+  );
   const allCollectorsFailed =
     usageChosen.length > 0 &&
     usageChosen.every((a) => usageStates[a.id] === "error");
@@ -759,16 +783,25 @@ function App() {
             </h1>
           </div>
           {view === "overview" && usageChosen.length > 0 && (
-            activeCollectors.length > 0 ? (
+            allCollectorsFailed ? (
+              <span className="live-pill pill-error" data-live-state="error">
+                <span className="dot stale" aria-hidden="true" />
+                本地采集读取失败
+              </span>
+            ) : partialCollectors.length > 0 ? (
+              <span className="live-pill pill-warn" data-live-state="partial">
+                <span className="dot warn" aria-hidden="true" />
+                部分采集受限（有日志不可读）·{" "}
+                {partialCollectors.map((a) => a.name).join("、")}
+                {activeCollectors.length > 0
+                  ? ` · 正常：${activeCollectors.map((a) => a.name).join("、")}`
+                  : ""}
+              </span>
+            ) : activeCollectors.length > 0 ? (
               <span className="live-pill" data-live-state="active">
                 <span className="dot live pulse" aria-hidden="true" />
                 本地增量监听中 ·{" "}
                 {activeCollectors.map((a) => a.name).join("、")}
-              </span>
-            ) : allCollectorsFailed ? (
-              <span className="live-pill pill-error" data-live-state="error">
-                <span className="dot stale" aria-hidden="true" />
-                本地采集读取失败
               </span>
             ) : allCollectorsWaiting ? (
               <span className="live-pill" data-live-state="waiting">

@@ -607,7 +607,8 @@ small,
   box-shadow: 0 0 0 3px var(--healthy-soft);
 }
 
-.dot.stale {
+.dot.stale,
+.dot.warn {
   background: var(--warn);
   box-shadow: 0 0 0 3px var(--warn-soft);
 }
@@ -616,7 +617,8 @@ small,
   background: var(--text-tertiary);
 }
 
-.pill-error {
+.pill-error,
+.pill-warn {
   color: var(--warn-text);
   background: var(--warn-soft);
   border-color: rgba(245, 158, 11, 0.24);
@@ -900,7 +902,8 @@ small,
   color: var(--text-tertiary);
 }
 
-.footer-error {
+.footer-error,
+.footer-warn {
   color: var(--warn-text);
 }
 

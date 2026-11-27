@@ -406,11 +406,11 @@ fn antigravity_hidden_transcript_dedup_partial_line_restart_and_waiting_recovery
     assert_eq!(waiting.today, None);
     assert_eq!(waiting.latest, None);
 
-    // Brain directory appears -> auto-recovers to Active; empty directory still has None (not fake 0).
+    // Brain directory appears without logs yet -> stays Waiting; empty state has None (not fake 0).
     fs::create_dir_all(&brain)?;
-    let empty_active = mon.update(&store, "antigravity", &brain)?;
-    assert_eq!(empty_active.status, SourceStatus::Active);
-    assert_eq!(empty_active.today, None);
+    let empty_waiting = mon.update(&store, "antigravity", &brain)?;
+    assert_eq!(empty_waiting.status, SourceStatus::Waiting);
+    assert_eq!(empty_waiting.today, None);
 
     // Create a new conversation under hidden `.system_generated/logs/transcript.jsonl`,
     // plus duplicate `transcript_full.jsonl` and `chunks/transcript/00000000.jsonl` which must be ignored.
@@ -938,12 +938,12 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
         }
     }
 
-    // Open with new Store -> upgrades schema to v4, preserves Antigravity cursors & queues repair tasks.
+    // Open with new Store -> upgrades schema to v5, preserves Antigravity cursors & queues repair tasks.
     let store = Store::open(&db_path)?;
     {
         let con = store.connect()?;
         let ver: i32 = con.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        assert_eq!(ver, 4);
+        assert_eq!(ver, 5);
         assert!(store.antigravity_repair_pending()?);
         let codex_cursor_fp: String = con.query_row(
             "SELECT fingerprint FROM cursors WHERE provider='codex'",
@@ -997,7 +997,8 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
 
     // Also verify History daily/weekly/monthly totals do not double across reopens.
     let hist_day = history::query(&store_reopened, Granularity::Day, 0, Some("antigravity"), None, None)?;
-    let today_bucket = hist_day.buckets.last().unwrap();
+    assert_eq!(hist_day.buckets.len(), 1);
+    let today_bucket = hist_day.buckets.first().unwrap();
     assert_eq!(today_bucket.verified_tokens, Some(300));
     assert_eq!(today_bucket.incomplete_steps, 1);
     assert_eq!(today_bucket.legacy_steps, 1);
@@ -1051,55 +1052,47 @@ fn history_cross_day_week_month_and_cross_year_boundaries() -> anyhow::Result<()
 
     let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
 
-    // Daily check: 11-29 = 100, 11-30 = 200, 12-01 = 300
-    let day_page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
-    assert_eq!(day_page.buckets.len(), 30);
-    assert!(day_page.has_older);
-    assert!(!day_page.has_newer);
-    let by_day = |k: &str| day_page.buckets.iter().find(|b| b.key == k).unwrap().verified_tokens;
-    assert_eq!(by_day("2026-11-29"), Some(100));
-    assert_eq!(by_day("2026-11-30"), Some(200));
-    assert_eq!(by_day("2026-12-01"), Some(300));
+    // Daily single-day pages: offset 0 = 12-01 (300), offset 1 = 11-30 (200), offset 2 = 11-29 (100)
+    let day0 = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+    assert_eq!(day0.buckets.len(), 1);
+    assert_eq!(day0.range_start, "2026-12-01");
+    assert_eq!(day0.summary.verified_tokens, Some(300));
+    assert!(day0.has_older);
+    assert!(!day0.has_newer);
+    let day1 = history::query_with_tz(&store, Granularity::Day, 1, None, None, None, today, &tz)?;
+    assert_eq!(day1.range_start, "2026-11-30");
+    assert_eq!(day1.summary.verified_tokens, Some(200));
+    let day2 = history::query_with_tz(&store, Granularity::Day, 2, None, None, None, today, &tz)?;
+    assert_eq!(day2.range_start, "2026-11-29");
+    assert_eq!(day2.summary.verified_tokens, Some(100));
 
-    // Weekly check (Monday start): 11-23..11-29 = 100, 11-30..12-06 = 500 (is_current)
-    let week_page = history::query_with_tz(&store, Granularity::Week, 0, None, None, None, today, &tz)?;
-    assert_eq!(week_page.buckets.len(), 12);
-    let w_prev = week_page.buckets.iter().find(|b| b.key == "2026-11-23..2026-11-29").unwrap();
-    let w_curr = week_page.buckets.iter().find(|b| b.key == "2026-11-30..2026-12-06").unwrap();
-    assert_eq!(w_prev.verified_tokens, Some(100));
-    assert!(!w_prev.is_current);
-    assert_eq!(w_curr.verified_tokens, Some(500));
-    assert!(w_curr.is_current);
+    // Weekly single-week pages (Monday start): offset 0 = 11-30..12-01 (500), offset 1 = 11-23..11-29 (100)
+    let week0 = history::query_with_tz(&store, Granularity::Week, 0, None, None, None, today, &tz)?;
+    assert_eq!(week0.range_start, "2026-11-30");
+    assert_eq!(week0.range_end, "2026-12-01");
+    assert!(week0.is_current);
+    assert_eq!(week0.summary.verified_tokens, Some(500));
+    let week1 = history::query_with_tz(&store, Granularity::Week, 1, None, None, None, today, &tz)?;
+    assert_eq!(week1.range_start, "2026-11-23");
+    assert_eq!(week1.range_end, "2026-11-29");
+    assert!(!week1.is_current);
+    assert_eq!(week1.summary.verified_tokens, Some(100));
 
-    // Drill-down on current week sums to 500
-    let w_drill = history::query_with_tz(
-        &store,
-        Granularity::Day,
-        0,
-        None,
-        Some(NaiveDate::from_ymd_opt(2026, 11, 30).unwrap()),
-        Some(NaiveDate::from_ymd_opt(2026, 12, 6).unwrap()),
-        today,
-        &tz,
-    )?;
-    assert_eq!(w_drill.summary.verified_tokens, Some(500));
-
-    // Monthly check: 2026-11 = 300, 2026-12 = 300, 2026-01 = 75; page offset=1 reaches 2025-12 = 50
-    let month_page = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
-    assert_eq!(month_page.buckets.len(), 12);
-    assert!(month_page.has_older);
-    let by_month = |k: &str| month_page.buckets.iter().find(|b| b.key == k).unwrap().verified_tokens;
-    assert_eq!(by_month("2026-01"), Some(75));
-    assert_eq!(by_month("2026-11"), Some(300));
-    assert_eq!(by_month("2026-12"), Some(300));
-
-    let older_months = history::query_with_tz(&store, Granularity::Month, 1, None, None, None, today, &tz)?;
-    assert!(older_months.has_newer);
-    assert!(!older_months.has_older);
-    assert_eq!(
-        older_months.buckets.iter().find(|b| b.key == "2025-12").unwrap().verified_tokens,
-        Some(50)
-    );
+    // Monthly single-month pages: 2026-12 = 300, 2026-11 = 300, 2026-01 = 75, 2025-12 = 50
+    let dec26 = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
+    assert_eq!(dec26.range_start, "2026-12-01");
+    assert_eq!(dec26.range_end, "2026-12-01");
+    assert_eq!(dec26.summary.verified_tokens, Some(300));
+    let nov26 = history::query_with_tz(&store, Granularity::Month, 1, None, None, None, today, &tz)?;
+    assert_eq!(nov26.range_start, "2026-11-01");
+    assert_eq!(nov26.range_end, "2026-11-30");
+    assert_eq!(nov26.summary.verified_tokens, Some(300));
+    let jan26 = history::query_with_tz(&store, Granularity::Month, 11, None, None, None, today, &tz)?;
+    assert_eq!(jan26.summary.verified_tokens, Some(75));
+    let dec25 = history::query_with_tz(&store, Granularity::Month, 12, None, None, None, today, &tz)?;
+    assert!(dec25.has_newer);
+    assert!(!dec25.has_older);
+    assert_eq!(dec25.summary.verified_tokens, Some(50));
     let _ = tz.timestamp_opt(0, 0);
     Ok(())
 }
@@ -1158,35 +1151,20 @@ fn history_partial_backfill_merges_fields_and_preserves_original_date() -> anyho
     assert_eq!(count, 1);
 
     let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
-    let day_page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
-    assert_eq!(
-        day_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap().verified_tokens,
-        Some(420)
-    );
-    assert_eq!(
-        day_page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap().verified_tokens,
-        None
-    );
+    let day_dec1 = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+    assert_eq!(day_dec1.summary.verified_tokens, None);
+    let day_nov29 = history::query_with_tz(&store, Granularity::Day, 2, None, None, None, today, &tz)?;
+    assert_eq!(day_nov29.summary.verified_tokens, Some(420));
 
-    let week_page = history::query_with_tz(&store, Granularity::Week, 0, None, None, None, today, &tz)?;
-    assert_eq!(
-        week_page.buckets.iter().find(|b| b.key == "2026-11-23..2026-11-29").unwrap().verified_tokens,
-        Some(420)
-    );
-    assert_eq!(
-        week_page.buckets.iter().find(|b| b.key == "2026-11-30..2026-12-06").unwrap().verified_tokens,
-        None
-    );
+    let week_curr = history::query_with_tz(&store, Granularity::Week, 0, None, None, None, today, &tz)?;
+    assert_eq!(week_curr.summary.verified_tokens, None);
+    let week_prev = history::query_with_tz(&store, Granularity::Week, 1, None, None, None, today, &tz)?;
+    assert_eq!(week_prev.summary.verified_tokens, Some(420));
 
-    let month_page = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
-    assert_eq!(
-        month_page.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens,
-        Some(420)
-    );
-    assert_eq!(
-        month_page.buckets.iter().find(|b| b.key == "2026-12").unwrap().verified_tokens,
-        None
-    );
+    let month_dec = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
+    assert_eq!(month_dec.summary.verified_tokens, None);
+    let month_nov = history::query_with_tz(&store, Granularity::Month, 1, None, None, None, today, &tz)?;
+    assert_eq!(month_nov.summary.verified_tokens, Some(420));
     Ok(())
 }
 
@@ -1246,7 +1224,7 @@ fn history_distinguishes_empty_zero_all_missing_legacy_and_disabled_provider() -
     )?;
 
     let today = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
-    let page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+    let page = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
     let bucket = |k: &str| page.buckets.iter().find(|b| b.key == k).unwrap();
 
     // 1. Empty
@@ -1272,7 +1250,7 @@ fn history_distinguishes_empty_zero_all_missing_legacy_and_disabled_provider() -
 
     // Disable Antigravity: its saved 200 must still be queryable without re-enabling collection!
     store.select(vec!["codex".into()])?;
-    let ag_only = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
+    let ag_only = history::query_with_tz(&store, Granularity::Month, 0, Some("antigravity"), None, None, today, &tz)?;
     assert_eq!(
         ag_only.buckets.iter().find(|b| b.key == "2026-11-25").unwrap().verified_tokens,
         Some(200)
@@ -1361,7 +1339,7 @@ fn history_dst_23h_and_25h_days_do_not_assume_86400_seconds() -> anyhow::Result<
 
     let page = history::query_with_tz(
         &store,
-        Granularity::Day,
+        Granularity::Month,
         0,
         None,
         None,
@@ -1431,7 +1409,7 @@ fn antigravity_out_of_order_field_merge_and_restart_persistence() -> anyhow::Res
         assert_eq!(count, 1);
 
         let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
-        let page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+        let page = history::query_with_tz(&store, Granularity::Month, 1, None, None, None, today, &tz)?;
         assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-27").unwrap().verified_tokens, Some(500));
         assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap().verified_tokens, None);
         assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap().verified_tokens, None);
@@ -1488,13 +1466,15 @@ fn antigravity_out_of_order_field_merge_and_restart_persistence() -> anyhow::Res
         assert_eq!(count, 1);
 
         let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
-        let day_page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
-        assert_eq!(day_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap().verified_tokens, Some(420));
-        assert_eq!(day_page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap().verified_tokens, None);
+        let day_nov29 = history::query_with_tz(&store, Granularity::Day, 2, None, None, None, today, &tz)?;
+        assert_eq!(day_nov29.summary.verified_tokens, Some(420));
+        let day_dec01 = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+        assert_eq!(day_dec01.summary.verified_tokens, None);
 
-        let month_page = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
-        assert_eq!(month_page.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens, Some(420));
-        assert_eq!(month_page.buckets.iter().find(|b| b.key == "2026-12").unwrap().verified_tokens, None);
+        let month_nov = history::query_with_tz(&store, Granularity::Month, 1, None, None, None, today, &tz)?;
+        assert_eq!(month_nov.summary.verified_tokens, Some(420));
+        let month_dec = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
+        assert_eq!(month_dec.summary.verified_tokens, None);
     }
 
     // Explicit 0 is a valid newer value and must not be overwritten by later missing field.
@@ -1519,10 +1499,11 @@ fn antigravity_out_of_order_field_merge_and_restart_persistence() -> anyhow::Res
         )?;
         Monitor::default().update(&store, "antigravity", &brain)?;
         let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
-        let page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
-        assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap().verified_tokens, Some(330));
-        assert_eq!(page.buckets.iter().find(|b| b.key == "2026-11-30").unwrap().verified_tokens, None);
-        assert_eq!(page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap().verified_tokens, None);
+        let nov_page = history::query_with_tz(&store, Granularity::Month, 1, Some("antigravity"), None, None, today, &tz)?;
+        assert_eq!(nov_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap().verified_tokens, Some(330));
+        assert_eq!(nov_page.buckets.iter().find(|b| b.key == "2026-11-30").unwrap().verified_tokens, None);
+        let dec_page = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+        assert_eq!(dec_page.summary.verified_tokens, None);
     }
 
     Ok(())
@@ -1586,13 +1567,23 @@ fn v2_upgrade_repairs_antigravity_and_resumes_after_interruption() -> anyhow::Re
             "confirmed": true
         });
         con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
-        let dec1 = chrono::DateTime::parse_from_rfc3339("2026-12-01T10:00:00+08:00")?;
+        let nov29_a = chrono::DateTime::parse_from_rfc3339("2026-11-29T09:00:00+08:00")?;
+        let nov29_b = chrono::DateTime::parse_from_rfc3339("2026-11-29T10:00:00+08:00")?;
+        let nov30 = chrono::DateTime::parse_from_rfc3339("2026-11-30T11:00:00+08:00")?;
         let nov28 = chrono::DateTime::parse_from_rfc3339("2026-11-28T10:00:00+08:00")?;
         let nov29 = chrono::DateTime::parse_from_rfc3339("2026-11-29T08:00:00+08:00")?;
-        // 7d76bf1 skipped Step A, left Step B as Dec 1 partial 100, and had a deleted-log row (777) + Codex row (5000).
+        // 7b1ecd9-written v2 conv-main (Step 1 incomplete 0, Step 2 complete 420) + conv-second (175) + deleted-log (777) + Codex (5000).
         con.execute(
-            "INSERT INTO usage VALUES('antigravity','conv-main','2',?1,100,?2,0,NULL,100,NULL,0)",
-            rusqlite::params![dec1.timestamp(), dec1.timestamp_nanos_opt()],
+            "INSERT INTO usage VALUES('antigravity','conv-main','1',?1,0,?2,0,NULL,NULL,NULL,0)",
+            rusqlite::params![nov29_a.timestamp(), nov29_a.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO usage VALUES('antigravity','conv-main','2',?1,420,?2,1,300,100,20,0)",
+            rusqlite::params![nov29_b.timestamp(), nov29_b.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO usage VALUES('antigravity','conv-second','1',?1,175,?2,1,100,50,25,0)",
+            rusqlite::params![nov30.timestamp(), nov30.timestamp_nanos_opt()],
         )?;
         con.execute(
             "INSERT INTO usage VALUES('antigravity','conv-deleted','1',?1,777,?2,1,700,50,27,0)",
@@ -1680,15 +1671,15 @@ fn v2_upgrade_repairs_antigravity_and_resumes_after_interruption() -> anyhow::Re
     }
 
     let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
-    let day_page = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
-    let b28 = day_page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap();
+    let nov_page = history::query_with_tz(&store, Granularity::Month, 1, Some("antigravity"), None, None, today, &tz)?;
+    let b28 = nov_page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap();
     assert_eq!((b28.verified_tokens, b28.legacy_steps, b28.legacy_tokens), (None, 1, Some(777)));
-    let b29 = day_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap();
+    let b29 = nov_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap();
     assert_eq!((b29.verified_tokens, b29.verified_steps, b29.incomplete_steps, b29.incomplete_known.clone()), (Some(420), 1, 1, None));
-    let b30 = day_page.buckets.iter().find(|b| b.key == "2026-11-30").unwrap();
+    let b30 = nov_page.buckets.iter().find(|b| b.key == "2026-11-30").unwrap();
     assert_eq!(b30.verified_tokens, Some(175));
-    let b01 = day_page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap();
-    assert_eq!((b01.verified_tokens, b01.incomplete_steps), (None, 0));
+    let dec_page = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
+    assert_eq!((dec_page.summary.verified_tokens, dec_page.summary.incomplete_steps), (None, 0));
 
     let codex_fp: String = store.connect()?.query_row("SELECT fingerprint FROM cursors WHERE provider='codex'", [], |r| r.get(0))?;
     assert_eq!(codex_fp, "codex-fp");
@@ -1729,64 +1720,43 @@ fn history_year_granularity_monthly_drilldown_and_current_end_date_capping() -> 
 
     let today = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
 
-    // Week: current week end_date & range_end must cap at today (2026-11-26), not Sunday (2026-11-29).
+    // Week: single current week 2026-11-23..2026-11-26 (daily buckets summed to 300), previous week 11-16..11-22 empty.
     let week_page =
         history::query_with_tz(&store, Granularity::Week, 0, None, None, None, today, &tz)?;
+    assert_eq!(week_page.range_start, "2026-11-23");
     assert_eq!(week_page.range_end, "2026-11-26");
-    let w_curr = week_page
-        .buckets
-        .iter()
-        .find(|b| b.key == "2026-11-23..2026-11-29")
-        .unwrap();
-    assert!(w_curr.is_current);
-    assert_eq!(w_curr.end_date, "2026-11-26");
-    assert_eq!(w_curr.verified_tokens, Some(300));
+    assert!(week_page.is_current);
+    assert_eq!(week_page.buckets.len(), 4);
+    assert_eq!(week_page.summary.verified_tokens, Some(300));
 
-    // Month: current month end_date & range_end must cap at today (2026-11-26), not month-end (2026-11-30).
+    // Month: single current month 2026-11-01..2026-11-26 (26 daily buckets summed to 300).
     let month_page =
         history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
+    assert_eq!(month_page.range_start, "2026-11-01");
     assert_eq!(month_page.range_end, "2026-11-26");
-    let m_curr = month_page.buckets.iter().find(|b| b.key == "2026-11").unwrap();
-    assert!(m_curr.is_current);
-    assert_eq!(m_curr.end_date, "2026-11-26");
-    assert_eq!(m_curr.verified_tokens, Some(300));
+    assert!(month_page.is_current);
+    assert_eq!(month_page.buckets.len(), 26);
+    assert_eq!(month_page.summary.verified_tokens, Some(300));
 
-    // Year: returns 5 calendar years (2022..2026), range_end == "2026-11-26".
+    // Year: single current year 2026-01-01..2026-11-26 (11 monthly buckets summed to 375).
     let year_page =
         history::query_with_tz(&store, Granularity::Year, 0, None, None, None, today, &tz)?;
-    assert_eq!(year_page.buckets.len(), 5);
-    assert_eq!(year_page.range_start, "2022-01-01");
+    assert_eq!(year_page.range_start, "2026-01-01");
     assert_eq!(year_page.range_end, "2026-11-26");
-    let y2025 = year_page.buckets.iter().find(|b| b.key == "2025").unwrap();
-    assert!(!y2025.is_current);
-    assert_eq!(y2025.end_date, "2025-12-31");
-    assert_eq!(y2025.verified_tokens, Some(50));
-    let y2026 = year_page.buckets.iter().find(|b| b.key == "2026").unwrap();
-    assert!(y2026.is_current);
-    assert_eq!(y2026.end_date, "2026-11-26");
-    assert_eq!(y2026.verified_tokens, Some(375));
+    assert!(year_page.is_current);
+    assert_eq!(year_page.buckets.len(), 11);
+    assert_eq!(year_page.summary.verified_tokens, Some(375));
+    assert_eq!(year_page.buckets.iter().find(|b| b.key == "2026-01").unwrap().verified_tokens, Some(75));
+    assert_eq!(year_page.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens, Some(300));
 
-    // Year monthly drill-down (2026-01-01 .. 2026-11-26): 11 months (2026-01 .. 2026-11), not 2026-12.
-    let y_drill = history::query_with_tz(
-        &store,
-        Granularity::Month,
-        0,
-        None,
-        Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
-        Some(NaiveDate::from_ymd_opt(2026, 11, 26).unwrap()),
-        today,
-        &tz,
-    )?;
-    assert_eq!(y_drill.buckets.len(), 11);
-    assert_eq!(
-        y_drill.buckets.iter().find(|b| b.key == "2026-01").unwrap().verified_tokens,
-        Some(75)
-    );
-    assert_eq!(
-        y_drill.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens,
-        Some(300)
-    );
-    assert_eq!(y_drill.summary.verified_tokens, Some(375));
+    // Previous Year (offset = 1): full calendar year 2025-01-01..2025-12-31 (12 months, total 50).
+    let prev_year =
+        history::query_with_tz(&store, Granularity::Year, 1, None, None, None, today, &tz)?;
+    assert_eq!(prev_year.range_start, "2025-01-01");
+    assert_eq!(prev_year.range_end, "2025-12-31");
+    assert!(!prev_year.is_current);
+    assert_eq!(prev_year.buckets.len(), 12);
+    assert_eq!(prev_year.summary.verified_tokens, Some(50));
     Ok(())
 }
 
@@ -1807,9 +1777,9 @@ fn v2_upgrade_disabled_antigravity_repairs_only_collected_prefix_and_resumes() -
     let t1 = logs1.join("transcript.jsonl");
     let t2 = logs2.join("transcript.jsonl");
 
-    // Pre-disable collected content in conv-disabled:
-    // - Step 1: DONE with all 3 token fields missing
-    // - Step 2: Nov 29 input=300, output=20 + Dec 1 cache_read=100
+    // Pre-disable collected content written by 7b1ecd9:
+    // - Step 1: DONE with all 3 token fields missing (saved as complete=0, 0)
+    // - Step 2: Nov 29 input=300, output=20 + Dec 1 cache_read=100 (merged to Nov 29 420, complete=1)
     fs::write(
         &t1,
         [
@@ -1830,7 +1800,7 @@ fn v2_upgrade_disabled_antigravity_repairs_only_collected_prefix_and_resumes() -
     let pos2 = t2.metadata()?.len() as i64;
     fs::remove_dir_all(brain.join("conv-deleted"))?;
 
-    // Build 7d76bf1 v2 database where Antigravity was ALREADY DISABLED before upgrading.
+    // Build v2 database matching 7b1ecd9 where Antigravity was ALREADY DISABLED before upgrading.
     {
         let con = rusqlite::Connection::open(&db_v2)?;
         con.execute_batch(
@@ -1850,11 +1820,16 @@ fn v2_upgrade_disabled_antigravity_repairs_only_collected_prefix_and_resumes() -
             "confirmed": true
         });
         con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
-        let dec1 = chrono::DateTime::parse_from_rfc3339("2026-12-01T10:00:00+08:00")?;
+        let nov29_a = chrono::DateTime::parse_from_rfc3339("2026-11-29T09:00:00+08:00")?;
+        let nov29_b = chrono::DateTime::parse_from_rfc3339("2026-11-29T10:00:00+08:00")?;
         let nov28 = chrono::DateTime::parse_from_rfc3339("2026-11-28T10:00:00+08:00")?;
         con.execute(
-            "INSERT INTO usage VALUES('antigravity','conv-disabled','2',?1,100,?2,0,NULL,100,NULL,0)",
-            rusqlite::params![dec1.timestamp(), dec1.timestamp_nanos_opt()],
+            "INSERT INTO usage VALUES('antigravity','conv-disabled','1',?1,0,?2,0,NULL,NULL,NULL,0)",
+            rusqlite::params![nov29_a.timestamp(), nov29_a.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO usage VALUES('antigravity','conv-disabled','2',?1,420,?2,1,300,100,20,0)",
+            rusqlite::params![nov29_b.timestamp(), nov29_b.timestamp_nanos_opt()],
         )?;
         con.execute(
             "INSERT INTO usage VALUES('antigravity','conv-deleted','1',?1,777,?2,1,700,50,27,0)",
@@ -1892,25 +1867,16 @@ fn v2_upgrade_disabled_antigravity_repairs_only_collected_prefix_and_resumes() -
     assert!(store.antigravity_repair_pending()?);
     usage::repair_antigravity_history(&store, &brain)?;
     assert!(!store.antigravity_repair_pending()?);
-
-    // Antigravity must stay disabled.
     assert!(store.enabled_agent("antigravity").is_err());
 
-    // Read-only history query verifies:
-    // - Step 1 restored as 1 incomplete step (incomplete_known = None) on Nov 29
-    // - Step 2 restored as 420 on Nov 29
-    // - conv-deleted kept as unverified legacy (777) on Nov 28
-    // - Dec 2 post-disable append (Step 3 = 1000) and new conv (800) were NOT imported!
     let today = NaiveDate::from_ymd_opt(2026, 12, 2).unwrap();
-    let day_page = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
-    let b28 = day_page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap();
+    let nov_page = history::query_with_tz(&store, Granularity::Month, 1, Some("antigravity"), None, None, today, &tz)?;
+    let b28 = nov_page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap();
     assert_eq!((b28.verified_tokens, b28.legacy_steps, b28.legacy_tokens), (None, 1, Some(777)));
-    let b29 = day_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap();
+    let b29 = nov_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap();
     assert_eq!((b29.verified_tokens, b29.verified_steps, b29.incomplete_steps, b29.incomplete_known.clone()), (Some(420), 1, 1, None));
-    let b01 = day_page.buckets.iter().find(|b| b.key == "2026-12-01").unwrap();
-    assert_eq!((b01.verified_tokens, b01.incomplete_steps), (None, 0));
-    let b02 = day_page.buckets.iter().find(|b| b.key == "2026-12-02").unwrap();
-    assert_eq!((b02.verified_tokens, b02.incomplete_steps), (None, 0));
+    let dec_page = history::query_with_tz(&store, Granularity::Month, 0, Some("antigravity"), None, None, today, &tz)?;
+    assert_eq!((dec_page.summary.verified_tokens, dec_page.summary.incomplete_steps), (None, 0));
 
     // Reopen twice: zero duplication.
     for _ in 0..2 {
@@ -1943,7 +1909,6 @@ fn v3_cursorless_disabled_antigravity_repairs_verifiable_and_keeps_unverifiable_
     let t_ok = logs_ok.join("transcript.jsonl");
     let t_mod = logs_mod.join("transcript.jsonl");
 
-    // Verifiable conversation: Step 1 (all missing) + Step 2 (Nov 29 in=300, out=20 -> Dec 1 cr=100) + post-disable Step 3 (999)
     fs::write(
         &t_ok,
         [
@@ -1956,7 +1921,6 @@ fn v3_cursorless_disabled_antigravity_repairs_verifiable_and_keeps_unverifiable_
         .join("\n")
             + "\n",
     )?;
-    // Unverifiable tampered log (on-disk step differs from v3 DB row -> cannot prove collection boundary)
     fs::write(
         &t_mod,
         format!(
@@ -1965,7 +1929,6 @@ fn v3_cursorless_disabled_antigravity_repairs_verifiable_and_keeps_unverifiable_
         ),
     )?;
 
-    // Build an authentic v3 database from 969f12a/9c9f61a (user_version=3, cursors deleted, legacy=1, repair_version='2', Antigravity disabled).
     {
         let con = rusqlite::Connection::open(&db_v3)?;
         con.execute_batch(
@@ -1994,12 +1957,18 @@ fn v3_cursorless_disabled_antigravity_repairs_verifiable_and_keeps_unverifiable_
         con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
         con.execute("INSERT INTO meta VALUES('antigravity_repair_version', '2')", [])?;
 
-        let dec1 = chrono::DateTime::parse_from_rfc3339("2026-12-01T10:00:00+08:00")?;
+        let nov29_a = chrono::DateTime::parse_from_rfc3339("2026-11-29T09:00:00+08:00")?;
+        let nov29_b = chrono::DateTime::parse_from_rfc3339("2026-11-29T10:00:00+08:00")?;
         let nov28 = chrono::DateTime::parse_from_rfc3339("2026-11-28T09:00:00+08:00")?;
         con.execute(
             "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
-             VALUES('antigravity','conv-verifiable','2',?1,100,?2,0,NULL,100,NULL,1)",
-            rusqlite::params![dec1.timestamp(), dec1.timestamp_nanos_opt()],
+             VALUES('antigravity','conv-verifiable','1',?1,0,?2,0,NULL,NULL,NULL,1)",
+            rusqlite::params![nov29_a.timestamp(), nov29_a.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
+             VALUES('antigravity','conv-verifiable','2',?1,420,?2,1,300,100,20,1)",
+            rusqlite::params![nov29_b.timestamp(), nov29_b.timestamp_nanos_opt()],
         )?;
         con.execute(
             "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
@@ -2015,18 +1984,14 @@ fn v3_cursorless_disabled_antigravity_repairs_verifiable_and_keeps_unverifiable_
     assert!(store.enabled_agent("antigravity").is_err());
 
     let today = NaiveDate::from_ymd_opt(2026, 12, 2).unwrap();
-    let page = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
-    let b28 = page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap();
-    // Tampered/unverifiable remains preserved as legacy unverified (555), NOT replaced with 666!
+    let nov_page = history::query_with_tz(&store, Granularity::Month, 1, Some("antigravity"), None, None, today, &tz)?;
+    let b28 = nov_page.buckets.iter().find(|b| b.key == "2026-11-28").unwrap();
     assert_eq!((b28.verified_tokens, b28.legacy_steps, b28.legacy_tokens), (None, 1, Some(555)));
-    let b29 = page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap();
-    // Verifiable session repairs Step 1 (incomplete) & Step 2 (420)
+    let b29 = nov_page.buckets.iter().find(|b| b.key == "2026-11-29").unwrap();
     assert_eq!((b29.verified_tokens, b29.verified_steps, b29.incomplete_steps), (Some(420), 1, 1));
-    let b02 = page.buckets.iter().find(|b| b.key == "2026-12-02").unwrap();
-    // Post-disable Step 3 (999) was NOT imported!
-    assert_eq!(b02.verified_tokens, None);
+    let dec_page = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
+    assert_eq!(dec_page.summary.verified_tokens, None);
 
-    // Reopen twice: idempotent, no duplicates
     for _ in 0..2 {
         let s = Store::open(&db_v3)?;
         assert!(!s.antigravity_repair_pending()?);
@@ -2041,94 +2006,368 @@ fn v3_cursorless_disabled_antigravity_repairs_verifiable_and_keeps_unverifiable_
 }
 
 #[test]
-fn history_current_period_caps_sql_upper_bound_at_today() -> anyhow::Result<()> {
+fn p1_v2_disabled_partial_7d76bf1_original_and_equal_length_rewrite_stay_legacy() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+
+    // Test BOTH cases for 7d76bf1 partial 100 (Dec 1) overwriting Nov 29 300+20:
+    // 1. Original unmodified log (reconstructed = 420, DB only saved 100 -> lacks evidence for 300+20)
+    // 2. Equal-length in-place rewrite changing 300 -> 900 (reconstructed = 1020, identical DB/inode/len)
+    for rewritten in [false, true] {
+        let dir = tempdir()?;
+        let db_v2 = dir.path().join("partial_v2.sqlite");
+        let brain = dir.path().join("brain");
+        let logs = brain.join("conv-rw/.system_generated/logs");
+        fs::create_dir_all(&logs)?;
+        let t1 = logs.join("transcript.jsonl");
+
+        let l1_orig = json!({
+            "step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE",
+            "created_at": "2026-11-29T10:00:00+08:00",
+            "input_tokens": 300, "output_tokens": 20
+        })
+        .to_string()
+            + "\n";
+        let l1_rewritten = json!({
+            "step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE",
+            "created_at": "2026-11-29T10:00:00+08:00",
+            "input_tokens": 900, "output_tokens": 20
+        })
+        .to_string()
+            + "\n";
+        assert_eq!(l1_orig.len(), l1_rewritten.len());
+
+        let l2 = json!({
+            "step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE",
+            "created_at": "2026-12-01T10:00:00+08:00",
+            "cache_read_tokens": 100
+        })
+        .to_string()
+            + "\n";
+
+        fs::write(&t1, format!("{l1_orig}{l2}"))?;
+        let fp_orig = test_file_id(&t1)?;
+        let len_orig = l1_orig.len() + l2.len();
+
+        {
+            let con = rusqlite::Connection::open(&db_v2)?;
+            con.execute_batch(
+                "PRAGMA user_version=2;
+                 CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+                 CREATE TABLE last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+                 CREATE TABLE usage(provider TEXT, session TEXT, response TEXT, at INTEGER NOT NULL, tokens INTEGER NOT NULL, at_ns INTEGER, complete INTEGER NOT NULL DEFAULT 1, input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER, legacy INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(provider,session,response));
+                 CREATE INDEX usage_date ON usage(provider,at);
+                 CREATE TABLE cursors(provider TEXT, path TEXT, fingerprint TEXT, pos INTEGER NOT NULL, PRIMARY KEY(provider,path));",
+            )?;
+            let settings = json!({
+                "agents": [{"id": "antigravity", "name": "Antigravity", "status": "installed", "binary": null}],
+                "enabled": [],
+                "confirmed": true
+            });
+            con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
+            let dec1 = chrono::DateTime::parse_from_rfc3339("2026-12-01T10:00:00+08:00")?;
+            con.execute(
+                "INSERT INTO usage VALUES('antigravity','conv-rw','2',?1,100,?2,0,NULL,100,NULL,0)",
+                rusqlite::params![dec1.timestamp(), dec1.timestamp_nanos_opt()],
+            )?;
+            con.execute(
+                "INSERT INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+                rusqlite::params![t1.to_string_lossy(), fp_orig, len_orig as i64],
+            )?;
+        }
+
+        if rewritten {
+            let mut f = fs::OpenOptions::new().write(true).truncate(true).open(&t1)?;
+            f.write_all(format!("{l1_rewritten}{l2}").as_bytes())?;
+            f.flush()?;
+            assert_eq!(test_file_id(&t1)?, fp_orig);
+            assert_eq!(t1.metadata()?.len() as usize, len_orig);
+        }
+
+        let store = Store::open(&db_v2)?;
+        usage::repair_antigravity_history(&store, &brain)?;
+        assert!(!store.antigravity_repair_pending()?);
+        assert_eq!(store.antigravity_repair_version()?, 5);
+
+        // Neither original 420 nor rewritten 1020 may enter verified_tokens without DB evidence of input/output!
+        let con = store.connect()?;
+        let rows: Vec<(String, i64, i64)> = {
+            let mut stmt = con.prepare(
+                "SELECT response, tokens, legacy FROM usage WHERE provider='antigravity' ORDER BY response",
+            )?;
+            let out = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            out
+        };
+        assert_eq!(rows, vec![("2".to_string(), 100, 1)]);
+
+        let today = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let dec = history::query_with_tz(&store, Granularity::Day, 0, Some("antigravity"), None, None, today, &tz)?;
+        assert_eq!(dec.summary.verified_tokens, None);
+        assert_eq!((dec.summary.legacy_steps, dec.summary.legacy_tokens), (1, Some(100)));
+    }
+    Ok(())
+}
+
+#[test]
+fn p2_mixed_7d76bf1_and_7b1ecd9_same_session_recovers_verified_step() -> anyhow::Result<()> {
     use chrono::{FixedOffset, NaiveDate};
     let tz = FixedOffset::east_opt(8 * 3600).unwrap();
     let dir = tempdir()?;
-    let store = Store::open(&dir.path().join("monitor.sqlite"))?;
-    store.settings(false, || vec![agent("codex", "installed")])?;
-    store.select(vec!["codex".into()])?;
+    let db_path = dir.path().join("mixed_v3.sqlite");
+    let brain = dir.path().join("brain");
+    let logs = brain.join("conv-mixed/.system_generated/logs");
+    fs::create_dir_all(&logs)?;
+    let t1 = logs.join("transcript.jsonl");
 
-    // Exact reproduction dataset: 11-26: 100, 11-27: 250, 12-01: 500
-    for (id, ts, tok) in [
-        ("r26", "2026-11-26T12:00:00+08:00", 100_i64),
-        ("r27", "2026-11-27T12:00:00+08:00", 250_i64),
-        ("r01", "2026-12-01T12:00:00+08:00", 500_i64),
+    // Same log file holds Step 1 (300+20 then 100) + Step 2 (300+20 then 100) + post-disable Step 3 (999)
+    fs::write(
+        &t1,
+        [
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T09:00:00+08:00", "input_tokens": 300, "output_tokens": 20}),
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-01T09:00:00+08:00", "cache_read_tokens": 100}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T10:00:00+08:00", "input_tokens": 300, "output_tokens": 20}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-01T10:00:00+08:00", "cache_read_tokens": 100}),
+            json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-02T10:00:00+08:00", "input_tokens": 900, "cache_read_tokens": 49, "output_tokens": 50}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n")
+            + "\n",
+    )?;
+
+    // DB had Step 1 written by 7d76bf1 (Dec 1 partial 100), Step 2 written by 7b1ecd9 (Nov 29 complete 420), then 969f12a v3 cursorless.
+    {
+        let con = rusqlite::Connection::open(&db_path)?;
+        con.execute_batch(
+            "PRAGMA user_version=3;
+             CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE usage(
+                provider TEXT, session TEXT, response TEXT, at INTEGER NOT NULL, tokens INTEGER NOT NULL,
+                at_ns INTEGER, complete INTEGER NOT NULL DEFAULT 1, input_tokens INTEGER,
+                cache_read_tokens INTEGER, output_tokens INTEGER, legacy INTEGER NOT NULL DEFAULT 0,
+                input_at_ns INTEGER, cache_read_at_ns INTEGER, output_at_ns INTEGER,
+                PRIMARY KEY(provider,session,response)
+             );
+             CREATE INDEX usage_date ON usage(provider,at);
+             CREATE TABLE cursors(provider TEXT, path TEXT, fingerprint TEXT, pos INTEGER NOT NULL, PRIMARY KEY(provider,path));",
+        )?;
+        let settings = json!({
+            "agents": [{"id": "antigravity", "name": "Antigravity", "status": "installed", "binary": null}],
+            "enabled": [],
+            "confirmed": true
+        });
+        con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
+        con.execute("INSERT INTO meta VALUES('antigravity_repair_version', '2')", [])?;
+
+        let dec1 = chrono::DateTime::parse_from_rfc3339("2026-12-01T09:00:00+08:00")?;
+        let nov29 = chrono::DateTime::parse_from_rfc3339("2026-11-29T10:00:00+08:00")?;
+        con.execute(
+            "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
+             VALUES('antigravity','conv-mixed','1',?1,100,?2,0,NULL,100,NULL,1)",
+            rusqlite::params![dec1.timestamp(), dec1.timestamp_nanos_opt()],
+        )?;
+        con.execute(
+            "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,input_tokens,cache_read_tokens,output_tokens,legacy)
+             VALUES('antigravity','conv-mixed','2',?1,420,?2,1,300,100,20,1)",
+            rusqlite::params![nov29.timestamp(), nov29.timestamp_nanos_opt()],
+        )?;
+    }
+
+    let store = Store::open(&db_path)?;
+    usage::repair_antigravity_history(&store, &brain)?;
+    assert!(!store.antigravity_repair_pending()?);
+    assert_eq!(store.antigravity_repair_version()?, 5);
+
+    let con = store.connect()?;
+    let rows: Vec<(String, i64, i64, i64)> = {
+        let mut stmt = con.prepare(
+            "SELECT response, tokens, complete, legacy FROM usage WHERE provider='antigravity' ORDER BY response",
+        )?;
+        let out = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        out
+    };
+    assert_eq!(rows, vec![("1".to_string(), 100, 0, 1), ("2".to_string(), 420, 1, 0)]);
+
+    let today = NaiveDate::from_ymd_opt(2026, 12, 2).unwrap();
+    let nov = history::query_with_tz(&store, Granularity::Day, 3, Some("antigravity"), None, None, today, &tz)?;
+    assert_eq!(nov.summary.verified_tokens, Some(420));
+    let dec1 = history::query_with_tz(&store, Granularity::Day, 1, Some("antigravity"), None, None, today, &tz)?;
+    assert_eq!((dec1.summary.verified_tokens, dec1.summary.legacy_tokens), (None, Some(100)));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn p2_all_unreadable_partial_readable_and_recovery_status() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("status.sqlite"))?;
+    store.settings(false, || vec![agent("antigravity", "installed")])?;
+    store.select(vec!["antigravity".into()])?;
+
+    let brain = dir.path().join("brain");
+    let logs_a = brain.join("conv-a/.system_generated/logs");
+    fs::create_dir_all(&logs_a)?;
+    let ta = logs_a.join("transcript.jsonl");
+    let today_str = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+    fs::write(
+        &ta,
+        format!(
+            "{}\n",
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": format!("{today_str}T09:00:00+08:00"), "input_tokens": 60, "cache_read_tokens": 20, "output_tokens": 20})
+        ),
+    )?;
+
+    // 1. All existing logs unreadable -> Monitor::update returns Err (never Ok(Active)!)
+    let orig_a = fs::metadata(&ta)?.permissions();
+    fs::set_permissions(&ta, fs::Permissions::from_mode(0o000))?;
+    let mut mon = Monitor::default();
+    let err_all = mon.update(&store, "antigravity", &brain).unwrap_err().to_string();
+    assert!(err_all.contains("不可读"), "got: {err_all}");
+
+    // 2. Add a second readable session Z -> status = Partial, today = 222, unreadable_files = 1, warning = Some(...)
+    let logs_z = brain.join("conv-z/.system_generated/logs");
+    fs::create_dir_all(&logs_z)?;
+    let tz_file = logs_z.join("transcript.jsonl");
+    fs::write(
+        &tz_file,
+        format!(
+            "{}\n",
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": format!("{today_str}T10:00:00+08:00"), "input_tokens": 200, "cache_read_tokens": 12, "output_tokens": 10})
+        ),
+    )?;
+    let u_partial = mon.update(&store, "antigravity", &brain)?;
+    assert_eq!(u_partial.status, SourceStatus::Partial);
+    assert_eq!(u_partial.today, Some(222));
+    assert_eq!(u_partial.unreadable_files, 1);
+    assert!(u_partial.warning.as_deref().is_some_and(|w| w.contains("不可读")));
+
+    // Appending +50 to Z while A stays unreadable still collects Z cleanly and preserves Partial
+    {
+        let mut f = fs::OpenOptions::new().append(true).open(&tz_file)?;
+        writeln!(
+            f,
+            "{}",
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": format!("{today_str}T11:00:00+08:00"), "input_tokens": 30, "cache_read_tokens": 10, "output_tokens": 10})
+        )?;
+    }
+    let u_partial2 = mon.update(&store, "antigravity", &brain)?;
+    assert_eq!(u_partial2.status, SourceStatus::Partial);
+    assert_eq!(u_partial2.today, Some(272));
+
+    // 3. Restore A permission -> catches up A (+100 = 372), clears warning, status = Active
+    fs::set_permissions(&ta, orig_a)?;
+    let u_active = mon.update(&store, "antigravity", &brain)?;
+    assert_eq!(u_active.status, SourceStatus::Active);
+    assert_eq!(u_active.today, Some(372));
+    assert_eq!(u_active.unreadable_files, 0);
+    assert!(u_active.warning.is_none());
+
+    // 4. DB write error (e.g. read-only database file) propagates Err instead of being swallowed
+    let db_path = dir.path().join("ro.sqlite");
+    {
+        let s_ro = Store::open(&db_path)?;
+        s_ro.settings(false, || vec![agent("antigravity", "installed")])?;
+        s_ro.select(vec!["antigravity".into()])?;
+    }
+    let ro_perms = fs::metadata(&db_path)?.permissions();
+    fs::set_permissions(&db_path, fs::Permissions::from_mode(0o444))?;
+    let s_ro = Store::open(&db_path)?;
+    let db_err = Monitor::default().update(&s_ro, "antigravity", &brain);
+    fs::set_permissions(&db_path, ro_perms)?;
+    assert!(db_err.is_err(), "readonly sqlite must propagate write error");
+    Ok(())
+}
+
+#[test]
+fn history_single_period_views_exact_totals_paging_filter_and_cross_year() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("single_period.sqlite"))?;
+    store.settings(false, || {
+        vec![agent("codex", "installed"), agent("claude", "installed")]
+    })?;
+    store.select(vec!["codex".into(), "claude".into()])?;
+
+    // Exact acceptance dataset:
+    // 2026-09-28 = 10 (codex), 2026-11-01 = 30 (claude), 2026-11-23 = 50 (codex),
+    // 2026-11-27 = 70 (codex), future 2026-11-28 = 90 (codex).
+    for (prov, id, ts, tok) in [
+        ("codex", "d_sep28", "2026-09-28T12:00:00+08:00", 10_i64),
+        ("claude", "d_nov01", "2026-11-01T12:00:00+08:00", 30_i64),
+        ("codex", "d_nov23", "2026-11-23T12:00:00+08:00", 50_i64),
+        ("codex", "d_nov27", "2026-11-27T12:00:00+08:00", 70_i64),
+        ("codex", "d_nov28_future", "2026-11-28T12:00:00+08:00", 90_i64),
     ] {
         let dt = chrono::DateTime::parse_from_rfc3339(ts)?;
         store.connect()?.execute(
             "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,legacy)
-             VALUES('codex','s1',?1,?2,?3,?4,1,0)",
-            rusqlite::params![id, dt.timestamp(), tok, dt.timestamp_nanos_opt()],
+             VALUES(?1,'s1',?2,?3,?4,?5,1,0)",
+            rusqlite::params![prov, id, dt.timestamp(), tok, dt.timestamp_nanos_opt()],
         )?;
     }
 
-    // At 2026-11-26 (Beijing time): Week, Month, Year AND all drill-downs MUST be 100 (NOT 350 or 850)!
-    let d26 = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
-    let w26 = history::query_with_tz_and_drill(
-        &store, Granularity::Week, 0, None, None, None, d26, &tz, Some("2026-11-23..2026-11-29"),
-    )?;
-    assert_eq!(w26.buckets.iter().find(|b| b.key == "2026-11-23..2026-11-29").unwrap().verified_tokens, Some(100));
-    assert_eq!(w26.summary.verified_tokens, Some(100));
-    assert_eq!(w26.drill.as_ref().unwrap().summary.verified_tokens, Some(100));
+    let today = NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
 
-    let m26 = history::query_with_tz_and_drill(
-        &store, Granularity::Month, 0, None, None, None, d26, &tz, Some("2026-11"),
-    )?;
-    assert_eq!(m26.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens, Some(100));
-    assert_eq!(m26.summary.verified_tokens, Some(100));
-    assert_eq!(m26.drill.as_ref().unwrap().summary.verified_tokens, Some(100));
+    // Default open on 2026-11-27:
+    let day0 = history::query_with_tz(&store, Granularity::Day, 0, None, None, None, today, &tz)?;
+    assert_eq!((day0.range_start.as_str(), day0.range_end.as_str(), day0.summary.verified_tokens), ("2026-11-27", "2026-11-27", Some(70)));
+    assert!(day0.has_older && !day0.has_newer && day0.is_current);
 
-    let y26 = history::query_with_tz_and_drill(
-        &store, Granularity::Year, 0, None, None, None, d26, &tz, Some("2026"),
-    )?;
-    assert_eq!(y26.buckets.iter().find(|b| b.key == "2026").unwrap().verified_tokens, Some(100));
-    assert_eq!(y26.summary.verified_tokens, Some(100));
-    let y26_drill = y26.drill.as_ref().unwrap();
-    assert_eq!(y26_drill.summary.verified_tokens, Some(100));
-    assert_eq!(y26_drill.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens, Some(100));
+    let week0 = history::query_with_tz(&store, Granularity::Week, 0, None, None, None, today, &tz)?;
+    assert_eq!((week0.range_start.as_str(), week0.range_end.as_str(), week0.summary.verified_tokens), ("2026-11-23", "2026-11-27", Some(120)));
+    assert!(week0.has_older && !week0.has_newer && week0.is_current);
 
-    // Advance clock to 2026-11-27: 11-27 (250) is now included -> 350 across Week, Month, Year & drills; 12-01 (500) still excluded!
-    let d27 = NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
-    let w27 = history::query_with_tz_and_drill(
-        &store, Granularity::Week, 0, None, None, None, d27, &tz, Some("2026-11-23..2026-11-29"),
-    )?;
-    assert_eq!(w27.buckets.iter().find(|b| b.key == "2026-11-23..2026-11-29").unwrap().verified_tokens, Some(350));
-    assert_eq!(w27.drill.as_ref().unwrap().summary.verified_tokens, Some(350));
+    let month0 = history::query_with_tz(&store, Granularity::Month, 0, None, None, None, today, &tz)?;
+    assert_eq!((month0.range_start.as_str(), month0.range_end.as_str(), month0.summary.verified_tokens), ("2026-11-01", "2026-11-27", Some(150)));
+    assert!(month0.has_older && !month0.has_newer && month0.is_current);
 
-    let m27 = history::query_with_tz_and_drill(
-        &store, Granularity::Month, 0, None, None, None, d27, &tz, Some("2026-11"),
-    )?;
-    assert_eq!(m27.buckets.iter().find(|b| b.key == "2026-11").unwrap().verified_tokens, Some(350));
-    assert_eq!(m27.drill.as_ref().unwrap().summary.verified_tokens, Some(350));
+    let year0 = history::query_with_tz(&store, Granularity::Year, 0, None, None, None, today, &tz)?;
+    assert_eq!((year0.range_start.as_str(), year0.range_end.as_str(), year0.summary.verified_tokens), ("2026-01-01", "2026-11-27", Some(160)));
+    assert_eq!(year0.earliest_date.as_deref(), Some("2026-09-28"));
+    assert!(!year0.has_older && !year0.has_newer && year0.is_current);
 
-    let y27 = history::query_with_tz_and_drill(
-        &store, Granularity::Year, 0, None, None, None, d27, &tz, Some("2026"),
-    )?;
-    assert_eq!(y27.buckets.iter().find(|b| b.key == "2026").unwrap().verified_tokens, Some(350));
-    assert_eq!(y27.drill.as_ref().unwrap().summary.verified_tokens, Some(350));
+    // Clicking "older" once in each view:
+    let day1 = history::query_with_tz(&store, Granularity::Day, 1, None, None, None, today, &tz)?;
+    assert_eq!((day1.range_start.as_str(), day1.range_end.as_str(), day1.summary.verified_tokens), ("2026-11-26", "2026-11-26", None));
+    assert!(day1.has_older && day1.has_newer && !day1.is_current);
 
-    // Completed period (in 2027-01): full natural month 2026-11 = 350, full natural year 2026 = 850.
-    let jan27 = NaiveDate::from_ymd_opt(2027, 1, 15).unwrap();
-    let y_done = history::query_with_tz_and_drill(
-        &store, Granularity::Year, 0, None, None, None, jan27, &tz, Some("2026"),
-    )?;
-    assert_eq!(y_done.buckets.iter().find(|b| b.key == "2026").unwrap().verified_tokens, Some(850));
-    assert_eq!(y_done.drill.as_ref().unwrap().summary.verified_tokens, Some(850));
+    let week1 = history::query_with_tz(&store, Granularity::Week, 1, None, None, None, today, &tz)?;
+    assert_eq!((week1.range_start.as_str(), week1.range_end.as_str(), week1.summary.verified_tokens), ("2026-11-16", "2026-11-22", None));
+    assert!(week1.has_older && week1.has_newer);
 
-    // Explicit sub-month range honors exact start_date & end_date boundaries.
-    let partial_month = history::query_with_tz(
-        &store,
-        Granularity::Month,
-        0,
-        None,
-        Some(NaiveDate::from_ymd_opt(2026, 11, 27).unwrap()),
-        Some(NaiveDate::from_ymd_opt(2026, 11, 27).unwrap()),
-        jan27,
-        &tz,
+    let month1 = history::query_with_tz(&store, Granularity::Month, 1, None, None, None, today, &tz)?;
+    assert_eq!((month1.range_start.as_str(), month1.range_end.as_str(), month1.summary.verified_tokens), ("2026-10-01", "2026-10-31", None));
+    // Empty October still allows paging back to September (earliest = 2026-09-28).
+    assert!(month1.has_older && month1.has_newer);
+    let month2 = history::query_with_tz(&store, Granularity::Month, 2, None, None, None, today, &tz)?;
+    assert_eq!((month2.range_start.as_str(), month2.range_end.as_str(), month2.summary.verified_tokens), ("2026-09-01", "2026-09-30", Some(10)));
+    assert!(!month2.has_older && month2.has_newer);
+
+    // Provider filter: Claude only has Nov 01 (30), earliest_date = 2026-11-01, Month offset=0 has has_older = false.
+    let claude_month = history::query_with_tz(&store, Granularity::Month, 0, Some("claude"), None, None, today, &tz)?;
+    assert_eq!(claude_month.summary.verified_tokens, Some(30));
+    assert_eq!(claude_month.earliest_date.as_deref(), Some("2026-11-01"));
+    assert!(!claude_month.has_older);
+
+    // Add 2025-12-31 record -> Year enables "上一年度" and shows full 2025-01-01..2025-12-31
+    let y25 = chrono::DateTime::parse_from_rfc3339("2025-12-31T23:59:59+08:00")?;
+    store.connect()?.execute(
+        "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,legacy)
+         VALUES('codex','s1','y25',?1,?2,?3,1,0)",
+        rusqlite::params![y25.timestamp(), 40_i64, y25.timestamp_nanos_opt()],
     )?;
-    assert_eq!(partial_month.buckets[0].start_date, "2026-11-27");
-    assert_eq!(partial_month.buckets[0].end_date, "2026-11-27");
-    assert_eq!(partial_month.summary.verified_tokens, Some(250));
+    let year0_b = history::query_with_tz(&store, Granularity::Year, 0, None, None, None, today, &tz)?;
+    assert!(year0_b.has_older);
+    let year1 = history::query_with_tz(&store, Granularity::Year, 1, None, None, None, today, &tz)?;
+    assert_eq!((year1.range_start.as_str(), year1.range_end.as_str(), year1.summary.verified_tokens), ("2025-01-01", "2025-12-31", Some(40)));
+    assert!(!year1.has_older && year1.has_newer && !year1.is_current);
     Ok(())
 }

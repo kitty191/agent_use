@@ -34,7 +34,7 @@ AGENT_USE_DATA_DIR="$TMP_DIR" "target/release/bundle/macos/Agent Use.app/Content
 - **Codex**：启动、手动刷新及每五分钟通过本机 app-server 查询当前账号和额度（不发起模型请求），按返回窗口时长显示剩余百分比与重置倒计时。查询失败时区分 CLI 定位、登录状态与网络/限流环节，并保留上次成功快照及其原账号标签和查询时间。
 - **Codex / Claude Code**：首次读取已启用来源的 JSONL，之后通过文件系统事件增量更新。面板也会检查最近使用的日志是否增长，每 30 秒校验已启用平台的日志目录，以补读遗漏的文件。面板显示本机今日 Token 与最近一次响应。缺少记录的字段显示为「—」。
 - **Antigravity**：从本机对话日志 `~/.gemini/antigravity/brain/<conversation-id>/.system_generated/logs/transcript.jsonl` 增量统计今日已记录 Token 与最近一次模型步骤（不读取 `transcript_full.jsonl` 与 `chunks/`，无需登录 Google 账号或安装 `agy` CLI）。账号归属、模型池、剩余额度与重置时间仍暂不可查（详见 [docs/phase0_verification_report.md](docs/phase0_verification_report.md)）。
-- **历史用量统计**：顶部切换到「历史用量」直接查询 SQLite，支持按自然日（默认近 30 天）、自然周（默认近 12 周，周一起算，点击展开每日明细）、自然月（默认近 12 月，点击展开每日明细）、自然年（默认近 5 年，点击展开每月明细）及按平台筛选与向前翻页至最早记录；支持已停用平台的历史回看，且查询过程不触发全盘扫描、日志重读、额度联网或重启停用平台采集。主合计仅包含已核验完整 Token，并与「无已记录用量」「明确 0」「用量不完整」「旧版记录值」明确区分。
+- **历史用量统计**：顶部切换到「历史用量」直接查询 SQLite，每页聚焦单个自然周期并随粒度翻页：按日查看单天、按周看该自然周（周一起算）与逐日明细、按月看该自然月与逐日明细、按年看该自然年与逐月明细；支持按平台筛选、单独标注该平台最早记录，本周/本月/今年均统计至本地今天，过去周期按完整自然周期汇总；同时支持已停用平台历史回看与实时只读刷新，区分「无已记录用量」「明确为 0」「用量不完整」「旧版记录值」。
 - **DeepSeek 桌面端等**：当前展示本机发现状态，账号、Token 和额度采集取决于各自数据源后续验证。
 
 核心验证可运行 `cargo test -p agent-core` 和 `python3 scripts/test_phase0_snapshot.py`。macOS 官方重置时间已核对至分钟，一次跨终端真机验收中，19,618 Token 只计一次，前台界面更新延迟上界为 538 ms；独立应用包与 Antigravity 核验结果见 [docs/phase0_verification_report.md](docs/phase0_verification_report.md)。
