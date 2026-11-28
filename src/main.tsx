@@ -30,12 +30,38 @@ type WindowData = {
   minutes: number | null;
   used: number;
   reset: number | null;
+  label?: string | null;
+  models?: string[];
+  remaining_percent?: number | null;
+  remaining_amount?: number | null;
+  unit?: string | null;
+  disabled?: boolean;
+};
+type CreditBalance = {
+  amount: number;
+  unit?: string | null;
 };
 type Quota = {
+  provider?: string;
+  account_id?: string | null;
   account: string;
   plan: string | null;
   windows: WindowData[];
   checked_at: number;
+  source?: string;
+  source_kind?: string;
+  ai_credits?: CreditBalance | null;
+};
+type QuotaRefreshResult = {
+  quota: Quota | null;
+  fresh: boolean;
+  message: string | null;
+};
+type BridgeInfo = {
+  script_path: string;
+  snapshot_path: string;
+  settings_snippet: string;
+  wrap_command: string;
 };
 type ThemeMode = "system" | "light" | "dark";
 type ViewMode = "overview" | "history" | "settings";
@@ -43,7 +69,9 @@ type UsageReadState = "loading" | "active" | "partial" | "waiting" | "error";
 type PendingAction = "idle" | "initial" | "rescan" | "save";
 
 const USAGE_PROVIDERS = new Set(["codex", "claude", "antigravity"]);
+const QUOTA_PROVIDERS = new Set(["codex", "antigravity"]);
 const supportsLocalUsage = (id: string) => USAGE_PROVIDERS.has(id);
+const supportsQuota = (id: string) => QUOTA_PROVIDERS.has(id);
 
 const formatTime = (seconds: number) =>
   new Date(seconds * 1000).toLocaleString("zh-CN", {
@@ -54,19 +82,34 @@ const formatTime = (seconds: number) =>
     second: "2-digit",
   });
 
+const formatPercent = (value: number) =>
+  Number.isInteger(value)
+    ? value.toLocaleString()
+    : Number(value.toFixed(1)).toLocaleString();
+
+const windowRemainingPercent = (w: WindowData): number | null => {
+  if (w.remaining_percent != null && Number.isFinite(w.remaining_percent)) {
+    return Math.max(0, Math.min(100, w.remaining_percent));
+  }
+  return null;
+};
+
 const statusText = (a: Agent) =>
-  ({ installed: "已检测到", data: "仅发现本地数据", missing: "未检测到" })[
-    a.status
-  ] ?? a.status;
+  ({
+    installed: "已检测到",
+    data: "仅发现历史记录",
+    history: "仅有本地历史",
+    missing: "未检测到",
+  })[a.status] ?? a.status;
 
 const capability = (id: string) =>
   id === "codex"
-    ? "本机 Token · 联网查询账号额度"
+    ? "本机 Token · 在线账号与模型限额"
     : id === "claude"
-      ? "本机 Token · 离线读取"
+      ? "本机对话日志 Token · 离线统计"
       : id === "antigravity"
-        ? "本机对话日志 Token · 账号/额度/重置暂不可查"
-        : "安装状态 · 用量来源待验证";
+        ? "本机对话日志 Token · CLI statusLine / 官方设置限额"
+        : "已发现平台 · 用量与限额来源待验证";
 
 function formatParts(parts: TokenParts | null, showMissing: boolean) {
   if (!parts) return "";
@@ -201,192 +244,76 @@ function ThemeIcon({ mode }: { mode: ThemeMode }) {
   );
 }
 
-function QuotaPanel() {
-  const [quota, setQuota] = useState<Quota | null>(null);
-  const [fresh, setFresh] = useState(false),
-    [busy, setBusy] = useState(false),
-    [error, setError] = useState("");
-  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
-  const [retryAt, setRetryAt] = useState(0);
-  const alive = useRef(false),
-    inFlight = useRef(false),
-    unblock = useRef(0);
-
-  const refresh = useCallback(async () => {
-    if (inFlight.current || Date.now() < unblock.current) return;
-    inFlight.current = true;
-    setBusy(true);
-    setError("");
-    try {
-      const q = await invoke<Quota>("refresh_quota");
-      if (alive.current) {
-        setQuota(q);
-        setFresh(true);
-      }
-    } catch (err) {
-      if (alive.current) {
-        setError(String(err));
-        setFresh(false);
-        if (String(err).includes("限流")) {
-          unblock.current = Date.now() + 300000;
-          setRetryAt(unblock.current);
-        }
-      }
-    } finally {
-      inFlight.current = false;
-      if (alive.current) setBusy(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    alive.current = true;
-    async function open() {
-      try {
-        const q = await invoke<Quota | null>("last_quota");
-        if (alive.current) setQuota(q);
-      } catch (err) {
-        if (alive.current) setError(String(err));
-      }
-      if (alive.current) void refresh();
-    }
-    void open();
-    const poll = window.setInterval(refresh, 300000);
-    const tick = window.setInterval(
-      () => setNow(Math.floor(Date.now() / 1000)),
-      1000,
-    );
-    return () => {
-      alive.current = false;
-      window.clearInterval(poll);
-      window.clearInterval(tick);
-    };
-  }, [refresh]);
-
-  return (
-    <section className="quota panel">
-      <header className="quota-header">
-        <div className="title-cluster">
-          <ProviderIcon id="codex" />
-          <div>
-            <span className="eyebrow">账号额度</span>
-            <h2>OpenAI Codex</h2>
-          </div>
-        </div>
-        <button
-          className="btn-secondary"
-          onClick={refresh}
-          disabled={busy || now * 1000 < retryAt}
-        >
-          <RefreshIcon spinning={busy} />
-          <span>{busy ? "正在查询…" : "刷新额度"}</span>
-        </button>
-      </header>
-
-      {error && (
-        <p role="status" className="notice">
-          {error}
-        </p>
-      )}
-
-      {quota ? (
-        <>
-          <div className="account-bar">
-            <span className={fresh ? "dot live" : "dot stale"} aria-hidden="true" />
-            <span className="account-label">
-              {fresh ? "查询账号" : "上次成功查询的账号"}
-            </span>
-            <span className="account-id">{quota.account}</span>
-            {quota.plan && (
-              <strong className="plan-badge">{quota.plan.toUpperCase()}</strong>
-            )}
-          </div>
-
-          {quota.windows.length === 0 && (
-            <p className="muted">当前账号未返回额度窗口</p>
-          )}
-
-          <div className="windows-grid">
-            {quota.windows.map((w, i) => {
-              const remaining = Math.max(0, Math.min(100, 100 - w.used));
-              const tone = quotaTone(remaining);
-              return (
-                <div className={`window tone-${tone}`} key={w.pool + i}>
-                  <div className="window-head">
-                    <div className="window-title">
-                      <span>{duration(w.minutes)}</span>
-                      <span className="pool-pill">{w.pool}</span>
-                    </div>
-                    <div className="window-percent">
-                      <span className="percent-label">剩余</span>
-                      <b>{remaining.toLocaleString()}%</b>
-                    </div>
-                  </div>
-                  <div
-                    className="progress-track"
-                    role="progressbar"
-                    aria-label={duration(w.minutes) + "剩余额度"}
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuenow={remaining}
-                  >
-                    <div
-                      className={`progress-fill tone-${tone}`}
-                      style={{ width: `${remaining}%` }}
-                    />
-                  </div>
-                  <div className="timing">
-                    <span className="timing-reset">
-                      <ClockIcon />
-                      {w.reset == null
-                        ? "重置时间未知"
-                        : "重置时间 " + formatTime(w.reset)}
-                    </span>
-                    {w.reset != null && (
-                      <span className="countdown-pill">
-                        {countdown(w.reset - now)}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          <footer className="card-footer">
-            <ClockIcon />
-            <span>
-              {fresh ? "最近查询成功" : "历史快照"} ·{" "}
-              {formatTime(quota.checked_at)}
-            </span>
-          </footer>
-        </>
-      ) : (
-        <div className="empty-well">
-          <p className="muted">
-            {busy ? "正在通过本机 Codex 查询…" : "暂无已确认的额度数据"}
-          </p>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function UsagePanel({
+function PlatformCard({
   agent,
+  enabled,
+  enabling,
+  onEnable,
+  onOpenHistory,
   onStatusChange,
 }: {
   agent: Agent;
+  enabled: boolean;
+  enabling: boolean;
+  onEnable: (id: string) => void;
+  onOpenHistory: (id: string) => void;
   onStatusChange?: (id: string, status: UsageReadState | null) => void;
 }) {
-  const [usage, setUsage] = useState<Usage | null>(null),
-    [err, setErr] = useState("");
-  const supported = supportsLocalUsage(agent.id);
+  const [usage, setUsage] = useState<Usage | null>(null);
+  const [usageErr, setUsageErr] = useState("");
+  const [quota, setQuota] = useState<Quota | null>(null);
+  const [fresh, setFresh] = useState(false);
+  const [quotaBusy, setQuotaBusy] = useState(false);
+  const [quotaErr, setQuotaErr] = useState("");
+  const [quotaNote, setQuotaNote] = useState("");
+  const [bridgeInfo, setBridgeInfo] = useState<BridgeInfo | null>(null);
+  const [copiedKey, setCopiedKey] = useState("");
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  const [retryAt, setRetryAt] = useState(0);
 
+  const alive = useRef(false);
+  const inFlight = useRef(false);
+  const unblock = useRef(0);
+  const manualReadRef = useRef<(() => Promise<void>) | null>(null);
+  const copyTimerRef = useRef(0);
+
+  const localSupported = supportsLocalUsage(agent.id);
+  const quotaSupported = supportsQuota(agent.id);
+  const isHistoryOnly = agent.status === "data";
+  const isDbHistory = agent.status === "history";
+  const hasSavedHistory = isHistoryOnly || isDbHistory;
+
+  // Local usage collector (active polling only when enabled; read-only snapshot for disabled history-only/db-history).
   useEffect(() => {
-    if (!supported) {
+    if (!localSupported) {
+      setUsage(null);
+      setUsageErr("");
       onStatusChange?.(agent.id, null);
       return;
     }
+    if (!enabled || isDbHistory) {
+      onStatusChange?.(agent.id, null);
+      if (!hasSavedHistory) {
+        setUsage(null);
+        setUsageErr("");
+        return;
+      }
+      let active = true;
+      void invoke<Usage>("saved_usage", { id: agent.id })
+        .then((u) => {
+          if (active) {
+            setUsage(u);
+            setUsageErr("");
+          }
+        })
+        .catch((e) => {
+          if (active) setUsageErr(String(e));
+        });
+      return () => {
+        active = false;
+      };
+    }
+
     onStatusChange?.(agent.id, "loading");
     let active = true,
       reading = false,
@@ -399,7 +326,7 @@ function UsagePanel({
         const u = await invoke<Usage>("local_usage", { id: agent.id });
         if (active) {
           setUsage(u);
-          setErr("");
+          setUsageErr("");
           onStatusChange?.(
             agent.id,
             u.status === "active"
@@ -411,14 +338,14 @@ function UsagePanel({
         }
       } catch (e) {
         if (active) {
-          setErr(String(e));
+          setUsageErr(String(e));
           onStatusChange?.(agent.id, "error");
         }
       }
       reading = false;
-      // Leave time within the two-second display target for IPC and WebView rendering.
       if (active) timer = window.setTimeout(read, 1000);
     }
+    manualReadRef.current = read;
     function onVisible() {
       if (document.visibilityState === "visible") void read();
     }
@@ -427,34 +354,283 @@ function UsagePanel({
     void read();
     return () => {
       active = false;
+      manualReadRef.current = null;
       onStatusChange?.(agent.id, null);
       window.removeEventListener("focus", onVisible);
       document.removeEventListener("visibilitychange", onVisible);
       window.clearTimeout(timer);
     };
-  }, [agent.id, supported, onStatusChange]);
+  }, [agent.id, enabled, hasSavedHistory, isDbHistory, localSupported, onStatusChange]);
+
+  const refreshQuota = useCallback(async () => {
+    if (!enabled || isDbHistory || !quotaSupported) return;
+    if (inFlight.current || Date.now() < unblock.current) return;
+    inFlight.current = true;
+    setQuotaBusy(true);
+    setQuotaErr("");
+    try {
+      const res = await invoke<QuotaRefreshResult>("refresh_provider_quota", {
+        id: agent.id,
+      });
+      if (alive.current) {
+        if (res.quota != null) setQuota(res.quota);
+        setFresh(res.fresh);
+        setQuotaNote(res.message ?? "");
+      }
+    } catch (err) {
+      if (alive.current) {
+        setQuotaErr(String(err));
+        setFresh(false);
+        if (String(err).includes("限流")) {
+          unblock.current = Date.now() + 300000;
+          setRetryAt(unblock.current);
+        }
+      }
+    } finally {
+      inFlight.current = false;
+      if (alive.current) setQuotaBusy(false);
+    }
+  }, [agent.id, enabled, quotaSupported]);
+
+  useEffect(() => {
+    alive.current = true;
+    if (!enabled || !quotaSupported) {
+      setQuota(null);
+      setFresh(false);
+      setQuotaBusy(false);
+      setQuotaErr("");
+      setQuotaNote("");
+      return () => {
+        alive.current = false;
+      };
+    }
+
+    async function open() {
+      try {
+        const cached = await invoke<Quota | null>("last_provider_quota", {
+          id: agent.id,
+        });
+        if (alive.current && cached) {
+          setQuota(cached);
+          setFresh(false);
+        }
+      } catch (err) {
+        if (alive.current) setQuotaErr(String(err));
+      }
+      if (alive.current) void refreshQuota();
+    }
+    void open();
+
+    const pollMs = agent.id === "codex" ? 300000 : 30000;
+    const poll = window.setInterval(refreshQuota, pollMs);
+    const tick = window.setInterval(
+      () => setNow(Math.floor(Date.now() / 1000)),
+      1000,
+    );
+    return () => {
+      alive.current = false;
+      window.clearInterval(poll);
+      window.clearInterval(tick);
+    };
+  }, [agent.id, enabled, quotaSupported, refreshQuota]);
+
+  useEffect(() => {
+    if (agent.id !== "antigravity" || !enabled || isDbHistory) {
+      setBridgeInfo(null);
+      return;
+    }
+    let active = true;
+    void invoke<BridgeInfo>("antigravity_bridge_info")
+      .then((info) => {
+        if (active) setBridgeInfo(info);
+      })
+      .catch(() => {
+        // Optional helper metadata; card still works without it.
+      });
+    return () => {
+      active = false;
+    };
+  }, [agent.id, enabled, isDbHistory]);
+
+  useEffect(() => {
+    return () => {
+      window.clearTimeout(copyTimerRef.current);
+    };
+  }, []);
+
+  const copyBridgeText = useCallback(async (key: string, text: string) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const el = document.createElement("textarea");
+        el.value = text;
+        el.style.position = "fixed";
+        el.style.opacity = "0";
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand("copy");
+        document.body.removeChild(el);
+      }
+      setCopiedKey(key);
+      window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = window.setTimeout(() => setCopiedKey(""), 1800);
+    } catch {
+      // Ignore clipboard permission denial silently; code snippet remains selectable.
+    }
+  }, []);
+
+  const handleRefreshCard = () => {
+    if (localSupported && enabled && manualReadRef.current) {
+      void manualReadRef.current();
+    }
+    if (enabled && quotaSupported) {
+      void refreshQuota();
+    }
+  };
+
+  const badgeClass = hasSavedHistory
+    ? "state state-data"
+    : enabled
+      ? "state state-installed"
+      : "state state-disabled";
+  const badgeText = isDbHistory
+    ? "仅有本地历史"
+    : isHistoryOnly
+      ? enabled
+        ? "仅发现历史记录 · 离线采集"
+        : "仅发现历史记录"
+      : enabled
+        ? "已启用"
+        : "未启用";
+
+  const showUsageBlock = localSupported && (enabled || hasSavedHistory);
+  const isLocalSnapshot =
+    quota != null &&
+    (quota.source_kind === "local_snapshot" ||
+      (quota.provider === "antigravity" && quota.source_kind !== "live_query"));
 
   return (
-    <article
-      className="usage panel"
+    <section
+      className="quota panel platform-card"
       data-provider={agent.id}
+      data-card-state={
+        isDbHistory
+          ? "history-only"
+          : isHistoryOnly
+            ? enabled
+              ? "data-enabled"
+              : "data-only"
+            : enabled
+              ? "enabled"
+              : "disabled"
+      }
       data-latest-at={usage?.latest_at}
     >
-      <header className="usage-header">
+      <header className="quota-header">
         <div className="title-cluster">
           <ProviderIcon id={agent.id} />
           <div>
-            <h3>{agent.name}</h3>
-            <small className="provider-sub">{capability(agent.id)}</small>
+            <span className="eyebrow">用量与限额</span>
+            <h2>{agent.name}</h2>
           </div>
         </div>
-        <span className={`state state-${agent.status}`}>
-          {statusText(agent)}
-        </span>
+        <div className="platform-actions">
+          <span className={badgeClass}>{badgeText}</span>
+          {isDbHistory ? (
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => onOpenHistory(agent.id)}
+            >
+              查看历史
+            </button>
+          ) : !enabled ? (
+            <>
+              {isHistoryOnly && (
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  onClick={() => onOpenHistory(agent.id)}
+                >
+                  查看历史
+                </button>
+              )}
+              <button
+                type="button"
+                className="primary btn-sm"
+                disabled={enabling}
+                onClick={() => onEnable(agent.id)}
+              >
+                {enabling
+                  ? "启用中…"
+                  : isHistoryOnly
+                    ? "启用离线采集"
+                    : "启用监控"}
+              </button>
+            </>
+          ) : (
+            (quotaSupported || localSupported) && (
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                onClick={handleRefreshCard}
+                disabled={quotaBusy || now * 1000 < retryAt}
+              >
+                <RefreshIcon spinning={quotaBusy} />
+                <span>{quotaBusy ? "正在查询…" : "刷新"}</span>
+              </button>
+            )
+          )}
+        </div>
       </header>
 
-      {supported ? (
+      <div className="account-bar">
+        {quota ? (
+          <>
+            <span
+              className={!isLocalSnapshot && fresh ? "dot live" : "dot stale"}
+              aria-hidden="true"
+            />
+            <span className="account-label">
+              {isLocalSnapshot
+                ? "快照账号"
+                : fresh
+                  ? "查询账号"
+                  : "上次成功查询的账号"}
+            </span>
+            <span className="account-id">{quota.account}</span>
+            {quota.plan && (
+              <strong className="plan-badge">{quota.plan.toUpperCase()}</strong>
+            )}
+          </>
+        ) : (
+          <>
+            <span className="dot idle" aria-hidden="true" />
+            <span className="account-label">
+              {isDbHistory
+                ? "原应用与日志目录已移除，仅保留本地数据库历史"
+                : !enabled
+                  ? isHistoryOnly
+                    ? "仅发现本机历史日志，未检测到应用安装或登录状态"
+                    : "平台未启用 · 启用后开始本机采集与额度读取"
+                  : agent.id === "antigravity"
+                    ? "账号与在线模型配额可在 Antigravity 设置 → Models 或 CLI statusLine 查看"
+                    : agent.id === "codex"
+                      ? quotaBusy
+                        ? "正在通过 Codex CLI 读取账号…"
+                        : "暂未读取到 Codex 账号信息"
+                      : localSupported
+                        ? "本机离线日志统计（无在线账号接口）"
+                        : "来源待验证"}
+            </span>
+          </>
+        )}
+      </div>
+
+      {showUsageBlock ? (
         <>
+          <div className="card-section-label">本机用量</div>
           <div className="metrics">
             <div className="metric-box">
               <small>今日已记录 Token</small>
@@ -518,6 +694,13 @@ function UsagePanel({
                   {formatParts(usage.latest_parts, true)}
                 </span>
               )}
+              {!usage?.latest_incomplete &&
+                !usage?.latest_legacy &&
+                usage?.latest_parts && (
+                  <span className="metric-hint">
+                    {formatParts(usage.latest_parts, false)}
+                  </span>
+                )}
               {!usage?.latest_incomplete && usage?.latest_legacy && (
                 <span className="metric-hint">
                   旧版记录值 {usage.latest_legacy_tokens?.toLocaleString() ?? "—"}{" "}
@@ -526,52 +709,262 @@ function UsagePanel({
               )}
             </div>
           </div>
-          {agent.id === "antigravity" && (
-            <p className="source-note">
-              来源：Antigravity 本机对话日志（按本地日期统计已完成模型步骤；仅含本机已记录用量，账号、模型池、剩余额度与重置时间暂不可查）。
-            </p>
-          )}
-          <footer
-            className={
-              err
-                ? "card-footer footer-error"
-                : usage?.status === "partial"
-                  ? "card-footer footer-warn"
-                  : "card-footer"
-            }
-          >
-            <ClockIcon />
-            <span>
-              {err
-                ? err
-                : usage?.status === "waiting"
-                  ? usage.latest_at
-                    ? "等待首次对话记录 · 历史最近" +
-                      (agent.id === "antigravity" ? "步骤 " : "用量 ") +
-                      formatTime(usage.latest_at)
-                    : "等待首次对话记录"
-                  : usage?.status === "partial"
-                    ? (usage.warning ?? "部分会话日志不可读，当前统计可能遗漏部分用量") +
-                      (usage.latest_at
-                        ? " · 最近" +
-                          (agent.id === "antigravity" ? "步骤 " : "用量 ") +
-                          formatTime(usage.latest_at)
-                        : "")
-                    : usage?.latest_at
-                      ? (agent.id === "antigravity" ? "最近步骤 " : "最近用量 ") +
-                        formatTime(usage.latest_at)
-                      : usage
-                        ? "尚未读到用量记录"
-                        : "读取本地记录中…"}
-            </span>
-          </footer>
         </>
+      ) : !enabled ? (
+        <div className="info-well">
+          <p className="muted">
+            已在本机检测到 {agent.name}，当前处于未启用状态，不会读取本地日志或联网查询；点击「启用监控」后开始展示。
+          </p>
+        </div>
       ) : (
         <div className="info-well">
           <p className="muted">用量与额度来源待验证</p>
         </div>
       )}
-    </article>
+
+      {enabled && quotaSupported && (
+        <>
+          <div className="card-section-label">模型与账号限额</div>
+          {quotaErr && (
+            <p role="status" className="notice">
+              {quotaErr}
+            </p>
+          )}
+          {!quotaErr && quota && quotaNote && (
+            <p className="source-note" style={{ marginTop: 10, marginBottom: 0 }}>
+              {quotaNote}
+            </p>
+          )}
+          {quota ? (
+            <>
+              {quota.windows.length > 0 ? (
+                <div className="windows-grid">
+                  {quota.windows.map((w, i) => {
+                    const remainingPct = windowRemainingPercent(w);
+                    const tone =
+                      remainingPct != null
+                        ? quotaTone(remainingPct)
+                        : "healthy";
+                    return (
+                      <div
+                        className={`window tone-${tone}`}
+                        key={`${w.pool}-${i}`}
+                      >
+                        <div className="window-head">
+                          <div className="window-title">
+                            <span>{w.label || duration(w.minutes)}</span>
+                            <span className="pool-pill">{w.pool}</span>
+                            {w.disabled && (
+                              <span className="state state-missing">已停用</span>
+                            )}
+                          </div>
+                          <div className="window-percent">
+                            <span className="percent-label">剩余</span>
+                            {remainingPct != null ? (
+                              <>
+                                <b>{formatPercent(remainingPct)}%</b>
+                                {w.remaining_amount != null && (
+                                  <span className="percent-label">
+                                    （{w.remaining_amount.toLocaleString()}
+                                    {w.unit ? ` ${w.unit}` : ""}）
+                                  </span>
+                                )}
+                              </>
+                            ) : w.remaining_amount != null ? (
+                              <>
+                                <b>{w.remaining_amount.toLocaleString()}</b>
+                                {w.unit && (
+                                  <span className="percent-label">{w.unit}</span>
+                                )}
+                              </>
+                            ) : (
+                              <b className="quota-unprovided">未提供</b>
+                            )}
+                          </div>
+                        </div>
+                        {w.models && w.models.length > 0 && (
+                          <div className="model-chips">
+                            {w.models.map((m) => (
+                              <span className="model-chip" key={m}>
+                                {m}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {remainingPct != null && (
+                          <div
+                            className="progress-track"
+                            role="progressbar"
+                            aria-label={(w.label || duration(w.minutes)) + "剩余额度"}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={remainingPct}
+                          >
+                            <div
+                              className={`progress-fill tone-${tone}`}
+                              style={{ width: `${remainingPct}%` }}
+                            />
+                          </div>
+                        )}
+                        <div
+                          className="timing"
+                          style={remainingPct == null ? { marginTop: 10 } : undefined}
+                        >
+                          <span className="timing-reset">
+                            <ClockIcon />
+                            {w.reset == null
+                              ? "重置时间未知"
+                              : "重置时间 " + formatTime(w.reset)}
+                          </span>
+                          {w.reset != null && (
+                            <span className="countdown-pill">
+                              {countdown(w.reset - now)}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                !quotaNote && (
+                  <div className="info-well">
+                    <p className="muted">
+                      {agent.id === "antigravity"
+                        ? "当前未收到 Antigravity CLI statusLine 额度池；模型限额可在 Antigravity 设置 → Models 查看。"
+                        : "当前账号未返回额度窗口"}
+                    </p>
+                  </div>
+                )
+              )}
+              {quota.ai_credits && (
+                <div className="credits-bar">
+                  <span>AI Credits 余额（与账号模型配额分开统计）</span>
+                  <strong>
+                    {quota.ai_credits.amount.toLocaleString()}{" "}
+                    {quota.ai_credits.unit ?? "Credits"}
+                  </strong>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="empty-well">
+              <p className="muted">
+                {agent.id === "antigravity"
+                  ? quotaNote ||
+                    "当前仅检测到 Antigravity 桌面版，模型限额请在 Antigravity 设置 → Models 查看；若使用 Antigravity CLI，可展开下方桥接配置接入 statusLine 快照。本地累计 Token 不用于推算官方剩余额度。"
+                  : quotaBusy
+                    ? "正在通过本机 Codex 查询额度…"
+                    : "暂无已确认的额度数据"}
+              </p>
+              {agent.id === "antigravity" && bridgeInfo && (
+                <details className="bridge-details">
+                  <summary>Antigravity CLI statusLine 桥接配置（已内置于应用包）</summary>
+                  <div className="bridge-body">
+                    <div className="bridge-actions">
+                      <button
+                        type="button"
+                        className="btn-secondary btn-sm"
+                        onClick={() =>
+                          void copyBridgeText(
+                            "settings",
+                            bridgeInfo.settings_snippet,
+                          )
+                        }
+                      >
+                        {copiedKey === "settings"
+                          ? "已复制配置"
+                          : "复制 settings.json 配置"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary btn-sm"
+                        onClick={() =>
+                          void copyBridgeText("wrap", bridgeInfo.wrap_command)
+                        }
+                      >
+                        {copiedKey === "wrap"
+                          ? "已复制包装命令"
+                          : "复制已有脚本包装命令"}
+                      </button>
+                    </div>
+                    <pre className="bridge-code">{bridgeInfo.settings_snippet}</pre>
+                    <p className="bridge-hint">
+                      已有自定义状态栏脚本时，可将 command 改为：
+                      <code>{bridgeInfo.wrap_command}</code>
+                    </p>
+                  </div>
+                </details>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
+      {(quota || showUsageBlock) && (
+        <div className="footer-stack">
+          {quota && (
+            <footer className="card-footer">
+              <ClockIcon />
+              <span>
+                {quota.source ? `额度来源：${quota.source} · ` : "额度来源 · "}
+                {isLocalSnapshot
+                  ? "快照采集时间"
+                  : fresh
+                    ? "最近查询成功"
+                    : "历史快照"}{" "}
+                · {formatTime(quota.checked_at)}
+              </span>
+            </footer>
+          )}
+          {showUsageBlock && (
+            <footer
+              className={
+                usageErr
+                  ? "card-footer footer-error"
+                  : usage?.status === "partial"
+                    ? "card-footer footer-warn"
+                    : "card-footer"
+              }
+            >
+              <ClockIcon />
+              <span>
+                {isDbHistory
+                  ? usage?.latest_at
+                    ? `仅有本地数据库历史 · 最近${agent.id === "antigravity" ? "步骤 " : "用量 "}${formatTime(usage.latest_at)}`
+                    : "仅有本地数据库历史（可在历史用量查看过往周期）"
+                  : !enabled && isHistoryOnly
+                    ? usage?.latest_at
+                      ? `已保存历史记录 · 最近${agent.id === "antigravity" ? "步骤 " : "用量 "}${formatTime(usage.latest_at)}`
+                      : "仅发现历史目录，当前未查到已保存 Token 记录"
+                    : usageErr
+                    ? usageErr
+                    : usage?.status === "waiting"
+                      ? usage.latest_at
+                        ? "等待首次对话记录 · 历史最近" +
+                          (agent.id === "antigravity" ? "步骤 " : "用量 ") +
+                          formatTime(usage.latest_at)
+                        : "等待首次对话记录"
+                      : usage?.status === "partial"
+                        ? (usage.warning ?? "部分会话日志不可读，当前统计可能遗漏部分用量") +
+                          (usage.latest_at
+                            ? " · 最近" +
+                              (agent.id === "antigravity" ? "步骤 " : "用量 ") +
+                              formatTime(usage.latest_at)
+                            : "")
+                        : usage?.latest_at
+                          ? (agent.id === "antigravity"
+                              ? "本机日志最近步骤 "
+                              : "本机日志最近用量 ") + formatTime(usage.latest_at)
+                          : usage
+                            ? "尚未读到本机用量记录"
+                            : "读取本地记录中…"}
+              </span>
+            </footer>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -630,6 +1023,9 @@ function App() {
   const themeLabel =
     theme === "system" ? "跟随系统外观" : theme === "light" ? "浅色外观" : "深色外观";
 
+  const [enablingId, setEnablingId] = useState<string | null>(null);
+  const [historyProvider, setHistoryProvider] = useState<string | null>(null);
+
   async function load(rescan: boolean) {
     setPending(rescan ? "rescan" : "initial");
     setError("");
@@ -649,7 +1045,7 @@ function App() {
         );
       setSettings(next);
       if (!rescan || !editing) setDraft(next.enabled);
-      if (rescan || !next.confirmed) setView("settings");
+      if (!next.confirmed) setView("settings");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -676,6 +1072,24 @@ function App() {
     }
   }
 
+  async function enableFromOverview(id: string) {
+    if (!settings) return;
+    setEnablingId(id);
+    setError("");
+    try {
+      const nextIds = settings.enabled.includes(id)
+        ? settings.enabled
+        : [...settings.enabled, id];
+      const next = await invoke<Settings>("save_selection", { ids: nextIds });
+      setSettings(next);
+      setDraft(next.enabled);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setEnablingId(null);
+    }
+  }
+
   const chosen =
     settings?.agents.filter((a) => settings.enabled.includes(a.id)) ?? [];
   const usageChosen = chosen.filter((a) => supportsLocalUsage(a.id));
@@ -695,6 +1109,17 @@ function App() {
     settings?.agents.filter(
       (a) => a.status !== "missing" || settings.enabled.includes(a.id),
     ) ?? [];
+  const overviewAgents = [...found].sort((a, b) => {
+    const rank = (x: Agent) => {
+      const isEn = settings?.enabled.includes(x.id) ?? false;
+      if (isEn && x.status === "installed") return 0;
+      if (isEn) return 1;
+      if (x.status === "installed") return 2;
+      if (x.status === "data") return 3;
+      return 4;
+    };
+    return rank(a) - rank(b);
+  });
   const missing = settings?.agents.filter((a) => !found.includes(a)) ?? [];
 
   return (
@@ -779,7 +1204,7 @@ function App() {
                 ? "平台管理"
                 : view === "history"
                   ? "历史用量"
-                  : "用量总览"}
+                  : "用量与限额"}
             </h1>
           </div>
           {view === "overview" && usageChosen.length > 0 && (
@@ -854,6 +1279,7 @@ function App() {
             <div className="agent-list">
               {found.map((a) => {
                 const checked = draft.includes(a.id);
+                const dbHistoryOnly = a.status === "history" && !checked;
                 return (
                   <label
                     className={checked ? "row row-selected" : "row"}
@@ -868,23 +1294,39 @@ function App() {
                       {newIds.includes(a.id) && (
                         <span className="new-pill">新发现</span>
                       )}
-                      <span className={`state state-${a.status}`}>
+                      <span
+                        className={`state state-${a.status === "history" ? "data" : a.status}`}
+                      >
                         {statusText(a)}
                       </span>
-                      <span className="switch">
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={(e) =>
-                            setDraft(
-                              e.target.checked
-                                ? [...draft, a.id]
-                                : draft.filter((id) => id !== a.id),
-                            )
-                          }
-                        />
-                        <span className="switch-track" aria-hidden="true" />
-                      </span>
+                      {dbHistoryOnly ? (
+                        <button
+                          type="button"
+                          className="btn-secondary btn-sm"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            setHistoryProvider(a.id);
+                            setView("history");
+                          }}
+                        >
+                          查看历史
+                        </button>
+                      ) : (
+                        <span className="switch">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) =>
+                              setDraft(
+                                e.target.checked
+                                  ? [...draft, a.id]
+                                  : draft.filter((id) => id !== a.id),
+                              )
+                            }
+                          />
+                          <span className="switch-track" aria-hidden="true" />
+                        </span>
+                      )}
                     </span>
                   </label>
                 );
@@ -917,23 +1359,35 @@ function App() {
         )}
 
         {settings && view === "history" && (
-          <HistoryView active={view === "history"} />
+          <HistoryView
+            active={view === "history"}
+            initialProvider={historyProvider}
+          />
         )}
 
         {settings?.confirmed && (
           <div hidden={view !== "overview"}>
-            {chosen.some((a) => a.id === "codex") && <QuotaPanel />}
-            {chosen.length > 0 ? (
+            {overviewAgents.length > 0 ? (
               <>
-                <div className="section-title">
-                  <h2>本机用量</h2>
-                  <span className="count-pill">{chosen.length} 个已选平台</span>
+                <div className="section-title" style={{ marginTop: 0 }}>
+                  <h2>已发现平台</h2>
+                  <span className="count-pill">
+                    共 {overviewAgents.length} 个平台 · 已启用 {chosen.length} 个
+                  </span>
                 </div>
-                <div className="cards">
-                  {chosen.map((a) => (
-                    <UsagePanel
+                <div className="overview-stack">
+                  {overviewAgents.map((a) => (
+                    <PlatformCard
                       key={a.id}
                       agent={a}
+                      enabled={settings.enabled.includes(a.id)}
+                      enabling={enablingId === a.id}
+                      onEnable={(id) => void enableFromOverview(id)}
+                      onOpenHistory={(id) => {
+                        setHistoryProvider(id);
+                        setView("history");
+                        setError("");
+                      }}
                       onStatusChange={handleUsageStatus}
                     />
                   ))}
@@ -941,17 +1395,10 @@ function App() {
               </>
             ) : (
               <section className="panel empty-state">
-                <h2>尚未启用平台</h2>
-                <p className="muted">前往平台管理，选择需要查看的本机工具。</p>
-                <button
-                  className="primary"
-                  onClick={() => {
-                    setDraft([]);
-                    setView("settings");
-                  }}
-                >
-                  选择平台
-                </button>
+                <h2>尚未发现平台</h2>
+                <p className="muted">
+                  安装 Codex、Antigravity 或 Claude Code 等工具后，点击右上角「重新扫描」。
+                </p>
               </section>
             )}
           </div>

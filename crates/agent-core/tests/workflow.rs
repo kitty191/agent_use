@@ -943,7 +943,7 @@ fn legacy_db_upgrade_backfills_antigravity_preserves_deleted_logs_and_keeps_code
     {
         let con = store.connect()?;
         let ver: i32 = con.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        assert_eq!(ver, 5);
+        assert_eq!(ver, 6);
         assert!(store.antigravity_repair_pending()?);
         let codex_cursor_fp: String = con.query_row(
             "SELECT fingerprint FROM cursors WHERE provider='codex'",
@@ -2369,5 +2369,952 @@ fn history_single_period_views_exact_totals_paging_filter_and_cross_year() -> an
     let year1 = history::query_with_tz(&store, Granularity::Year, 1, None, None, None, today, &tz)?;
     assert_eq!((year1.range_start.as_str(), year1.range_end.as_str(), year1.summary.verified_tokens), ("2025-01-01", "2025-12-31", Some(40)));
     assert!(!year1.has_older && year1.has_newer && !year1.is_current);
+    Ok(())
+}
+
+#[test]
+fn p1_v3_cursorless_reenable_keeps_unverified_legacy_and_imports_new_steps() -> anyhow::Result<()> {
+    use chrono::{FixedOffset, NaiveDate};
+    use std::io::Write;
+    let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+
+    for rewritten in [false, true] {
+        let dir = tempdir()?;
+        let db_v3 = dir.path().join("cursorless_v3.sqlite");
+        let brain = dir.path().join("brain");
+        let logs = brain.join("conv-reenable/.system_generated/logs");
+        fs::create_dir_all(&logs)?;
+        let t1 = logs.join("transcript.jsonl");
+
+        let l1 = json!({
+            "step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE",
+            "created_at": "2026-11-29T10:00:00+08:00",
+            "input_tokens": if rewritten { 900 } else { 300 },
+            "output_tokens": 20
+        });
+        let l2 = json!({
+            "step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE",
+            "created_at": "2026-12-01T10:00:00+08:00",
+            "cache_read_tokens": 100
+        });
+        let raw_orig = format!("{}\n{}\n", l1.to_string().replace("900", "300"), l2);
+        let raw = format!("{l1}\n{l2}\n");
+        if rewritten {
+            assert_eq!(raw.len(), raw_orig.len());
+        }
+        fs::write(&t1, &raw)?;
+
+        // Seed cursorless v3 DB left after 7d76bf1 (Dec 1 partial 100) + 969f12a (legacy=1, no cursors).
+        {
+            let con = rusqlite::Connection::open(&db_v3)?;
+            con.execute_batch(
+                "PRAGMA user_version=3;
+                 CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+                 CREATE TABLE last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+                 CREATE TABLE usage(provider TEXT, session TEXT, response TEXT, at INTEGER NOT NULL, tokens INTEGER NOT NULL, at_ns INTEGER, complete INTEGER NOT NULL DEFAULT 1, input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER, legacy INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(provider,session,response));
+                 CREATE INDEX usage_date ON usage(provider,at);
+                 CREATE TABLE cursors(provider TEXT, path TEXT, fingerprint TEXT, pos INTEGER NOT NULL, PRIMARY KEY(provider,path));",
+            )?;
+            let settings = json!({
+                "agents": [{"id": "antigravity", "name": "Antigravity", "status": "installed", "binary": null}],
+                "enabled": [],
+                "confirmed": true
+            });
+            con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
+            let dec01 = chrono::DateTime::parse_from_rfc3339("2026-12-01T10:00:00+08:00")?;
+            con.execute(
+                "INSERT INTO usage VALUES('antigravity','conv-reenable','2',?1,100,?2,0,NULL,100,NULL,1)",
+                rusqlite::params![dec01.timestamp(), dec01.timestamp_nanos_opt()],
+            )?;
+        }
+
+        // Upgrade & repair while disabled -> Step 2 must remain unverified legacy=1 (tokens=100, complete=0).
+        let store = Store::open(&db_v3)?;
+        usage::repair_antigravity_history(&store, &brain)?;
+        let row_dump = |s: &Store| -> anyhow::Result<Vec<(String, i64, i64, i64)>> {
+            let con = s.connect()?;
+            let mut stmt = con.prepare(
+                "SELECT response, tokens, complete, legacy FROM usage WHERE provider='antigravity' ORDER BY response",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        };
+        assert_eq!(row_dump(&store)?, vec![("2".into(), 100, 0, 1)]);
+
+        // Re-enable Antigravity without appending any logs; run same Monitor x2 and fresh Monitor + reopened Store.
+        store.select(vec!["antigravity".into()])?;
+        let mut mon = Monitor::default();
+        mon.update(&store, "antigravity", &brain)?;
+        assert_eq!(row_dump(&store)?, vec![("2".into(), 100, 0, 1)]);
+        mon.update(&store, "antigravity", &brain)?;
+        assert_eq!(row_dump(&store)?, vec![("2".into(), 100, 0, 1)]);
+
+        let store_reopen = Store::open(&db_v3)?;
+        Monitor::default().update(&store_reopen, "antigravity", &brain)?;
+        assert_eq!(row_dump(&store_reopen)?, vec![("2".into(), 100, 0, 1)]);
+
+        // Append genuine new Step 3 (500 tokens on Dec 2): Step 2 remains legacy 100 while Step 3 is imported once.
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&t1)?;
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": "2026-12-02T10:00:00+08:00",
+                    "input_tokens": 400, "cache_read_tokens": 50, "output_tokens": 50
+                })
+            )?;
+        }
+        mon.update(&store_reopen, "antigravity", &brain)?;
+        mon.update(&store_reopen, "antigravity", &brain)?;
+        assert_eq!(
+            row_dump(&store_reopen)?,
+            vec![("2".into(), 100, 0, 1), ("3".into(), 500, 1, 0)]
+        );
+        let today = NaiveDate::from_ymd_opt(2026, 12, 2).unwrap();
+        let dec = history::query_with_tz(&store_reopen, Granularity::Month, 0, Some("antigravity"), None, None, today, &tz)?;
+        assert_eq!(dec.summary.verified_tokens, Some(500));
+        assert_eq!(dec.summary.legacy_tokens, Some(100));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn p2_revoke_permission_after_eof_fails_partial_and_recovers_without_reread() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("revoke_eof.sqlite"))?;
+    store.settings(false, || vec![agent("antigravity", "installed")])?;
+    store.select(vec!["antigravity".into()])?;
+
+    let brain = dir.path().join("brain");
+    let logs1 = brain.join("conv-one/.system_generated/logs");
+    let logs2 = brain.join("conv-two/.system_generated/logs");
+    fs::create_dir_all(&logs1)?;
+    let t1 = logs1.join("transcript.jsonl");
+    let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+    fs::write(
+        &t1,
+        format!(
+            "{}\n",
+            json!({
+                "step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+                "created_at": format!("{today}T09:00:00+08:00"),
+                "input_tokens": 300, "cache_read_tokens": 100, "output_tokens": 20
+            })
+        ),
+    )?;
+
+    // 1. Read unique transcript to EOF -> Active (420).
+    let mut mon = Monitor::default();
+    let u0 = mon.update(&store, "antigravity", &brain)?;
+    assert_eq!(u0.status, SourceStatus::Active);
+    assert_eq!(u0.today, Some(420));
+
+    // 2. Revoke permission AFTER EOF with no append -> existing Monitor AND fresh Monitor both fail!
+    let orig_perm = fs::metadata(&t1)?.permissions();
+    fs::set_permissions(&t1, fs::Permissions::from_mode(0o000))?;
+    assert!(mon.update(&store, "antigravity", &brain).is_err());
+    assert!(mon.update(&store, "antigravity", &brain).is_err());
+    assert!(Monitor::default().update(&store, "antigravity", &brain).is_err());
+
+    // 3. Restore permission -> back to Active with same 420 and still 1 row.
+    fs::set_permissions(&t1, orig_perm.clone())?;
+    let u_rec = mon.update(&store, "antigravity", &brain)?;
+    assert_eq!(u_rec.status, SourceStatus::Active);
+    assert_eq!(u_rec.today, Some(420));
+    assert_eq!(u_rec.unreadable_files, 0);
+
+    // 4. Add second transcript -> total 600, then revoke only t1 after EOF -> Partial (unreadable=1, today=600).
+    fs::create_dir_all(&logs2)?;
+    let t2 = logs2.join("transcript.jsonl");
+    fs::write(
+        &t2,
+        format!(
+            "{}\n",
+            json!({
+                "step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+                "created_at": format!("{today}T10:00:00+08:00"),
+                "input_tokens": 100, "cache_read_tokens": 50, "output_tokens": 30
+            })
+        ),
+    )?;
+    let u_both = mon.update(&store, "antigravity", &brain)?;
+    assert_eq!(u_both.status, SourceStatus::Active);
+    assert_eq!(u_both.today, Some(600));
+
+    fs::set_permissions(&t1, fs::Permissions::from_mode(0o000))?;
+    let u_part1 = mon.update(&store, "antigravity", &brain)?;
+    assert_eq!(u_part1.status, SourceStatus::Partial);
+    assert_eq!(u_part1.unreadable_files, 1);
+    assert!(u_part1.warning.is_some());
+    assert_eq!(u_part1.today, Some(600));
+
+    let u_part_fresh = Monitor::default().update(&store, "antigravity", &brain)?;
+    assert_eq!(u_part_fresh.status, SourceStatus::Partial);
+    assert_eq!(u_part_fresh.unreadable_files, 1);
+
+    // 5. Restore permission on t1 -> returns Active with 600 and exactly 2 rows (no duplicates).
+    fs::set_permissions(&t1, orig_perm)?;
+    let u_final = mon.update(&store, "antigravity", &brain)?;
+    assert_eq!(u_final.status, SourceStatus::Active);
+    assert_eq!(u_final.unreadable_files, 0);
+    assert_eq!(u_final.warning, None);
+    assert_eq!(u_final.today, Some(600));
+    let rows: i64 = store
+        .connect()?
+        .query_row("SELECT COUNT(*) FROM usage WHERE provider='antigravity'", [], |r| r.get(0))?;
+    assert_eq!(rows, 2);
+    Ok(())
+}
+
+#[test]
+fn v5_to_v6_migrates_legacy_codex_quota_and_isolates_per_platform_and_account() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let db_path = dir.path().join("quota_v5.sqlite");
+    {
+        let con = rusqlite::Connection::open(&db_path)?;
+        con.execute_batch(
+            "PRAGMA user_version=5;
+             CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE usage(provider TEXT, session TEXT, response TEXT, at INTEGER NOT NULL, tokens INTEGER NOT NULL, at_ns INTEGER, complete INTEGER NOT NULL DEFAULT 1, input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER, legacy INTEGER NOT NULL DEFAULT 0, input_at_ns INTEGER, cache_read_at_ns INTEGER, output_at_ns INTEGER, PRIMARY KEY(provider,session,response));
+             CREATE INDEX usage_date ON usage(provider,at);
+             CREATE TABLE cursors(provider TEXT, path TEXT, fingerprint TEXT, pos INTEGER NOT NULL, PRIMARY KEY(provider,path));
+             CREATE TABLE antigravity_repair_tasks(kind TEXT NOT NULL, target TEXT PRIMARY KEY, fingerprint TEXT, max_pos INTEGER, done INTEGER NOT NULL DEFAULT 0);",
+        )?;
+        let settings = json!({
+            "agents": [
+                {"id": "codex", "name": "OpenAI Codex", "status": "installed", "binary": null},
+                {"id": "antigravity", "name": "Antigravity", "status": "installed", "binary": null},
+                {"id": "claude", "name": "Claude Code", "status": "data", "binary": null}
+            ],
+            "enabled": ["codex", "antigravity"],
+            "confirmed": true
+        });
+        con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
+        con.execute("INSERT INTO meta VALUES('antigravity_repair_version', '5')", [])?;
+        let legacy_codex_quota = json!({
+            "account": "c***@example.com",
+            "plan": "plus",
+            "checked_at": 1795800000,
+            "windows": [{"pool": "codex", "minutes": 10080, "used": 18.0, "reset": 1796200000}]
+        });
+        con.execute("INSERT INTO last_quota VALUES(1, ?1)", [legacy_codex_quota.to_string()])?;
+        let now_ts = chrono::Utc::now().timestamp();
+        con.execute(
+            "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,legacy) VALUES('claude','s1','m1',?1,333,?2,1,0)",
+            rusqlite::params![now_ts, now_ts * 1_000_000_000],
+        )?;
+    }
+
+    let store = Store::open(&db_path)?;
+    assert!(!store.antigravity_repair_pending()?);
+    let migrated_codex = store.cached_quota_for("codex", None)?.expect("migrated codex snapshot");
+    assert_eq!(migrated_codex.provider, "codex");
+    assert_eq!(migrated_codex.source, "Codex CLI app-server");
+    assert_eq!(migrated_codex.account, "c***@example.com");
+    assert_eq!(migrated_codex.windows[0].remaining_percent, Some(82.0));
+    assert!(store.cached_quota_for("antigravity", None)?.is_none());
+
+    // Save two separate Antigravity account snapshots -> Codex & both accounts stay isolated.
+    let ag1 = quota::Quota {
+        provider: "antigravity".into(),
+        account_id: quota::stable_account_id("antigravity", "alice@example.com"),
+        account: "a***@example.com".into(),
+        plan: Some("Pro".into()),
+        checked_at: 1795900000,
+        source: "Antigravity CLI statusLine".into(),
+        source_kind: "local_snapshot".into(),
+        ai_credits: None,
+        windows: vec![quota::Window {
+            pool: "gemini-shared".into(),
+            minutes: Some(300),
+            used: 20.0,
+            reset: Some(1795918000),
+            label: Some("Gemini Shared".into()),
+            models: vec!["Gemini 4 Neon".into(), "Gemini 4 Carbon".into()],
+            remaining_percent: Some(80.0),
+            remaining_amount: None,
+            unit: None,
+            disabled: false,
+        }],
+    };
+    let ag2 = quota::Quota {
+        account_id: quota::stable_account_id("antigravity", "bob@example.com"),
+        account: "b***@example.com".into(),
+        checked_at: 1795900500,
+        plan: Some("Ultra".into()),
+        ..ag1.clone()
+    };
+    store.save_quota_for("antigravity", &ag1)?;
+    store.save_quota_for("antigravity", &ag2)?;
+
+    let reopened = Store::open(&db_path)?;
+    assert_eq!(reopened.cached_quota_for("codex", None)?.unwrap().account, "c***@example.com");
+    assert_eq!(reopened.list_quota_snapshots("antigravity")?.len(), 2);
+    assert_eq!(reopened.cached_quota_for("antigravity", ag1.account_id.as_deref())?.unwrap().plan.as_deref(), Some("Pro"));
+    assert_eq!(reopened.cached_quota_for("antigravity", ag2.account_id.as_deref())?.unwrap().plan.as_deref(), Some("Ultra"));
+
+    // History-only disabled platform returns read-only saved_totals without enabling.
+    assert!(reopened.enabled_agent("claude").is_err());
+    let claude_saved = usage::saved_totals(&reopened, "claude")?;
+    assert_eq!(claude_saved.today, Some(333));
+    Ok(())
+}
+
+#[test]
+fn antigravity_statusline_parses_pools_models_amounts_resets_and_separates_context_credits() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let snap_path = dir.path().join("statusline.json");
+    let captured = chrono::DateTime::parse_from_rfc3339("2026-11-27T12:00:00Z")?;
+    let reset_iso = "2026-11-27T17:00:00Z";
+    let expected_reset = chrono::DateTime::parse_from_rfc3339(reset_iso)?.timestamp();
+
+    let payload = json!({
+        "product": "antigravity",
+        "email": "alice@example.com",
+        "plan_tier": "Pro",
+        "captured_at": "2026-11-27T12:00:00Z",
+        "context_window": {
+            "remaining_percentage": 85.76,
+            "used_percentage": 14.24
+        },
+        "cost": {
+            "total_usd": 0.42
+        },
+        "ai_credits": {
+            "remaining_amount": 42,
+            "unit": "Credits"
+        },
+        "quota": {
+            "gemini-4-neon": {
+                "pool_id": "gemini-shared",
+                "display_name": "Gemini 模型共用配额",
+                "model": "Gemini 4 Neon",
+                "remaining_fraction": 0.85,
+                "reset_time": reset_iso
+            },
+            "gemini-4-carbon": {
+                "pool_id": "gemini-shared",
+                "model": "Gemini 4 Carbon",
+                "remaining_fraction": 0.85,
+                "reset_time": reset_iso
+            },
+            "partner-credits": {
+                "label": "Partner Quota",
+                "remaining_amount": 120,
+                "unit": "次",
+                "reset_in_seconds": 3600
+            },
+            "legacy-pool": {
+                "remaining_fraction": 0.0,
+                "disabled": true
+            }
+        }
+    });
+    fs::write(&snap_path, payload.to_string())?;
+
+    let q1 = quota::read_antigravity_statusline(&snap_path)?;
+    assert_eq!(q1.provider, "antigravity");
+    assert_eq!(q1.source, "Antigravity CLI statusLine");
+    assert_eq!(q1.account, "a***@example.com");
+    assert_eq!(q1.plan.as_deref(), Some("Pro"));
+    assert_eq!(q1.checked_at, captured.timestamp());
+    assert_eq!(q1.ai_credits, Some(quota::CreditBalance { amount: 42.0, unit: Some("Credits".into()) }));
+    // Shared gemini-4-neon + gemini-4-carbon collapse into one pool, + partner-credits + legacy-pool = 3 rows;
+    // context_window & cost never enter windows.
+    assert_eq!(q1.windows.len(), 3);
+
+    let shared = q1.windows.iter().find(|w| w.pool == "gemini-shared").unwrap();
+    assert_eq!(shared.label.as_deref(), Some("Gemini 模型共用配额"));
+    assert_eq!(shared.remaining_percent, Some(85.0));
+    assert_eq!(shared.reset, Some(expected_reset));
+    assert_eq!(shared.models, vec!["Gemini 4 Carbon", "Gemini 4 Neon"]);
+
+    let amount_only = q1.windows.iter().find(|w| w.pool == "partner-credits").unwrap();
+    assert_eq!(amount_only.remaining_percent, None);
+    assert_eq!(amount_only.remaining_amount, Some(120.0));
+    assert_eq!(amount_only.unit.as_deref(), Some("次"));
+    assert_eq!(amount_only.reset, Some(captured.timestamp() + 3600));
+
+    let disabled_w = q1.windows.iter().find(|w| w.pool == "legacy-pool").unwrap();
+    assert!(disabled_w.disabled);
+    assert_eq!(disabled_w.remaining_percent, Some(0.0));
+
+    // Re-reading an unchanged file preserves exact checked_at (used to detect fresh=false without bumping time).
+    let q2 = quota::read_antigravity_statusline(&snap_path)?;
+    assert_eq!(q1, q2);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn same_initial_domain_accounts_stay_isolated_across_codex_and_antigravity_restart() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir()?;
+    let db_path = dir.path().join("accounts.sqlite");
+
+    // Seed legacy unrecoverable snapshot ("a***@example.com", no account_id) in v5 DB first.
+    {
+        let con = rusqlite::Connection::open(&db_path)?;
+        con.execute_batch(
+            "PRAGMA user_version=5;
+             CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE usage(provider TEXT, session TEXT, response TEXT, at INTEGER NOT NULL, tokens INTEGER NOT NULL, at_ns INTEGER, complete INTEGER NOT NULL DEFAULT 1, input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER, legacy INTEGER NOT NULL DEFAULT 0, input_at_ns INTEGER, cache_read_at_ns INTEGER, output_at_ns INTEGER, PRIMARY KEY(provider,session,response));
+             CREATE INDEX usage_date ON usage(provider,at);
+             CREATE TABLE cursors(provider TEXT, path TEXT, fingerprint TEXT, pos INTEGER NOT NULL, PRIMARY KEY(provider,path));
+             CREATE TABLE antigravity_repair_tasks(kind TEXT NOT NULL, target TEXT PRIMARY KEY, fingerprint TEXT, max_pos INTEGER, done INTEGER NOT NULL DEFAULT 0);",
+        )?;
+        let settings = json!({
+            "agents": [
+                {"id": "codex", "name": "OpenAI Codex", "status": "installed", "binary": null},
+                {"id": "antigravity", "name": "Antigravity", "status": "installed", "binary": null}
+            ],
+            "enabled": ["codex", "antigravity"],
+            "confirmed": true
+        });
+        con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
+        con.execute("INSERT INTO meta VALUES('antigravity_repair_version', '5')", [])?;
+        let legacy_codex = json!({
+            "account": "a***@example.com",
+            "plan": "free",
+            "checked_at": 1795000000,
+            "windows": [{"pool": "codex", "minutes": 10080, "used": 50.0, "reset": 1795500000}]
+        });
+        con.execute("INSERT INTO last_quota VALUES(1, ?1)", [legacy_codex.to_string()])?;
+    }
+
+    // Build mock Codex CLI that serves alice@example.com or adam@example.com via env var.
+    let bin = dir.path().join("codex-multi");
+    fs::write(
+        &bin,
+        r#"#!/usr/bin/env python3
+import json, os, sys
+email = os.environ["MOCK_EMAIL"]
+used = float(os.environ["MOCK_USED"])
+plan = os.environ["MOCK_PLAN"]
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg["method"] == "initialized": continue
+    if msg["method"] == "initialize": result = {}
+    elif msg["method"] == "account/read":
+        result = {"account": {"type": "chatgpt", "email": email, "planType": plan}}
+    elif msg["method"] == "account/rateLimits/read":
+        result = {"rateLimitsByLimitId": {"codex": {"primary": {"windowDurationMins": 10080, "usedPercent": used, "resetsAt": 1796000000}, "secondary": None}}}
+    else: sys.exit(1)
+    print(json.dumps({"id": msg["id"], "result": result}), flush=True)
+"#,
+    )?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
+
+    let store = Store::open(&db_path)?;
+
+    // Save alice@example.com & adam@example.com on Codex (both mask to "a***@example.com").
+    std::env::set_var("MOCK_EMAIL", "alice@example.com");
+    std::env::set_var("MOCK_USED", "10");
+    std::env::set_var("MOCK_PLAN", "plus");
+    let c_alice = quota::query(&bin).await?;
+    std::env::set_var("MOCK_EMAIL", "adam@example.com");
+    std::env::set_var("MOCK_USED", "40");
+    std::env::set_var("MOCK_PLAN", "pro");
+    let c_adam = quota::query(&bin).await?;
+
+    assert_eq!(c_alice.account, "a***@example.com");
+    assert_eq!(c_adam.account, "a***@example.com");
+    assert_ne!(c_alice.account_id, c_adam.account_id);
+    assert!(c_alice.account_id.is_some() && c_adam.account_id.is_some());
+    store.save_quota_for("codex", &c_alice)?;
+    store.save_quota_for("codex", &c_adam)?;
+
+    // Save alice@example.com & adam@example.com on Antigravity via statusLine JSON.
+    let ag_alice = quota::parse_antigravity_statusline_value(
+        &json!({
+            "product": "antigravity",
+            "email": "alice@example.com",
+            "plan_tier": "Pro",
+            "captured_at": 1795900100,
+            "quota": {"gemini-5h": {"remaining_fraction": 0.90}}
+        }),
+        1795900100,
+    )?;
+    let ag_adam = quota::parse_antigravity_statusline_value(
+        &json!({
+            "product": "antigravity",
+            "email": "adam@example.com",
+            "plan_tier": "Ultra",
+            "captured_at": 1795900200,
+            "quota": {"gemini-5h": {"remaining_fraction": 0.35}}
+        }),
+        1795900200,
+    )?;
+    assert_eq!(ag_alice.account, "a***@example.com");
+    assert_eq!(ag_adam.account, "a***@example.com");
+    assert_ne!(ag_alice.account_id, ag_adam.account_id);
+    store.save_quota_for("antigravity", &ag_alice)?;
+    store.save_quota_for("antigravity", &ag_adam)?;
+
+    // Reopen Store (restart): legacy unrecoverable Codex row + alice + adam = 3 Codex rows, and 2 Antigravity rows!
+    let reopened = Store::open(&db_path)?;
+    let codex_all = reopened.list_quota_snapshots("codex")?;
+    assert_eq!(codex_all.len(), 3, "legacy + alice + adam must all stay preserved");
+    let got_c_alice = reopened.cached_quota_for("codex", c_alice.account_id.as_deref())?.unwrap();
+    let got_c_adam = reopened.cached_quota_for("codex", c_adam.account_id.as_deref())?.unwrap();
+    let got_c_legacy = reopened.cached_quota_for("codex", Some("a***@example.com"))?.unwrap();
+    assert_eq!((got_c_alice.plan.as_deref(), got_c_alice.windows[0].remaining_percent), (Some("plus"), Some(90.0)));
+    assert_eq!((got_c_adam.plan.as_deref(), got_c_adam.windows[0].remaining_percent), (Some("pro"), Some(60.0)));
+    assert_eq!((got_c_legacy.plan.as_deref(), got_c_legacy.windows[0].remaining_percent), (Some("free"), Some(50.0)));
+
+    let ag_all = reopened.list_quota_snapshots("antigravity")?;
+    assert_eq!(ag_all.len(), 2, "alice and adam on Antigravity must stay separate");
+    let got_a_alice = reopened.cached_quota_for("antigravity", ag_alice.account_id.as_deref())?.unwrap();
+    let got_a_adam = reopened.cached_quota_for("antigravity", ag_adam.account_id.as_deref())?.unwrap();
+    assert_eq!((got_a_alice.plan.as_deref(), got_a_alice.windows[0].remaining_percent), (Some("Pro"), Some(90.0)));
+    assert_eq!((got_a_adam.plan.as_deref(), got_a_adam.windows[0].remaining_percent), (Some("Ultra"), Some(35.0)));
+    Ok(())
+}
+
+#[test]
+fn disabled_only_bucket_stays_none_and_older_or_empty_snapshot_cannot_overwrite_newer() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("merge_guards.sqlite"))?;
+    store.settings(false, || vec![agent("antigravity", "installed")])?;
+    store.select(vec!["antigravity".into()])?;
+
+    // 0. First-ever anonymous empty `{}` snapshot must not insert a phantom row and returns None with guidance.
+    let first_empty = quota::parse_antigravity_statusline_value(&json!({}), 150)?;
+    let (eff0, upd0, note0) = store.merge_quota_for("antigravity", &first_empty)?;
+    assert!(!upd0 && eff0.is_none());
+    assert_eq!(note0.as_deref(), Some("暂无有效额度快照"));
+    assert!(store.cached_quota_for("antigravity", None)?.is_none());
+    assert!(store.list_quota_snapshots("antigravity")?.is_empty());
+
+    // 1. Disabled-only & reset-only buckets must remain remaining_percent = None after parse, save, and reload.
+    let parsed_disabled = quota::parse_antigravity_statusline_value(
+        &json!({
+            "product": "antigravity",
+            "email": "alice@example.com",
+            "plan_tier": "Pro",
+            "captured_at": 200,
+            "quota": {
+                "disabled-only": {"disabled": true},
+                "reset-only": {"reset_time": "2026-11-27T18:00:00Z"},
+                "amount-only": {"remaining_amount": 75, "unit": "次"}
+            }
+        }),
+        200,
+    )?;
+    assert_eq!(parsed_disabled.source_kind, "local_snapshot");
+    let (saved, updated, _) = store.merge_quota_for("antigravity", &parsed_disabled)?;
+    let saved = saved.expect("valid snapshot must be stored");
+    assert!(updated);
+    let reloaded = store
+        .cached_quota_for("antigravity", saved.account_id.as_deref())?
+        .unwrap();
+    let d_w = reloaded.windows.iter().find(|w| w.pool == "disabled-only").unwrap();
+    assert!(d_w.disabled && d_w.remaining_percent.is_none() && d_w.remaining_amount.is_none());
+    let r_w = reloaded.windows.iter().find(|w| w.pool == "reset-only").unwrap();
+    assert!(r_w.remaining_percent.is_none() && r_w.reset.is_some());
+    let a_w = reloaded.windows.iter().find(|w| w.pool == "amount-only").unwrap();
+    assert!(a_w.remaining_percent.is_none() && a_w.remaining_amount == Some(75.0) && a_w.unit.as_deref() == Some("次"));
+
+    // 1b. AI Credits-only snapshot (no quota windows) is still valid effective data.
+    let credits_only = quota::parse_antigravity_statusline_value(
+        &json!({
+            "product": "antigravity",
+            "email": "credits@example.com",
+            "captured_at": 250,
+            "ai_credits": {"remaining": 42, "unit": "Credits"}
+        }),
+        250,
+    )?;
+    let (eff_c, upd_c, _) = store.merge_quota_for("antigravity", &credits_only)?;
+    let eff_c = eff_c.expect("ai_credits-only snapshot must be stored");
+    assert!(upd_c && eff_c.ai_credits.is_some() && eff_c.windows.is_empty());
+
+    // 2. Save t=300 with 37%, then try importing older t=100 (95%), same-account empty t=400,
+    //    AND anonymous `{}` (no email, no quota, no ai_credits) at t=400 -> must keep t=300 (37%) across refresh & reopen!
+    let newer = quota::parse_antigravity_statusline_value(
+        &json!({
+            "product": "antigravity",
+            "email": "alice@example.com",
+            "captured_at": 300,
+            "quota": {"gemini-5h": {"remaining_fraction": 0.37}}
+        }),
+        300,
+    )?;
+    let (eff1, upd1, _) = store.merge_quota_for("antigravity", &newer)?;
+    let eff1 = eff1.unwrap();
+    assert!(upd1 && eff1.checked_at == 300 && eff1.windows[0].remaining_percent == Some(37.0));
+
+    let older = quota::parse_antigravity_statusline_value(
+        &json!({
+            "product": "antigravity",
+            "email": "alice@example.com",
+            "captured_at": 100,
+            "quota": {"gemini-5h": {"remaining_fraction": 0.95}}
+        }),
+        100,
+    )?;
+    let (eff2, upd2, note2) = store.merge_quota_for("antigravity", &older)?;
+    let eff2 = eff2.unwrap();
+    assert!(!upd2 && note2.is_some());
+    assert_eq!(eff2.checked_at, 300);
+    assert_eq!(eff2.windows[0].remaining_percent, Some(37.0));
+
+    let empty_newer = quota::parse_antigravity_statusline_value(
+        &json!({
+            "product": "antigravity",
+            "email": "alice@example.com",
+            "captured_at": 400,
+            "quota": {}
+        }),
+        400,
+    )?;
+    let (eff3, upd3, note3) = store.merge_quota_for("antigravity", &empty_newer)?;
+    let eff3 = eff3.unwrap();
+    assert!(!upd3 && note3.is_some());
+    assert_eq!(eff3.checked_at, 300);
+    assert_eq!(eff3.windows[0].remaining_percent, Some(37.0));
+
+    let anon_empty = quota::parse_antigravity_statusline_value(&json!({}), 400)?;
+    assert_eq!(anon_empty.account, "未提供账号");
+    let (eff4, upd4, note4) = store.merge_quota_for("antigravity", &anon_empty)?;
+    let eff4 = eff4.unwrap();
+    assert!(!upd4 && note4.is_some());
+    assert_eq!(eff4.checked_at, 300);
+    assert_eq!(eff4.account, "a***@example.com");
+    assert_eq!(eff4.windows[0].remaining_percent, Some(37.0));
+
+    // Confirm anonymous `{}` did NOT insert a phantom row in quota_snapshots.
+    let raw_rows: i64 = store.connect()?.query_row(
+        "SELECT COUNT(*) FROM quota_snapshots WHERE provider='antigravity'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(raw_rows, 2, "only alice and credits@example.com rows should exist");
+
+    // Reopen DB -> default cached_quota_for("antigravity", None) STILL returns alice 37% (t=300)!
+    let reopened = Store::open(&dir.path().join("merge_guards.sqlite"))?;
+    let persisted = reopened.cached_quota_for("antigravity", None)?.unwrap();
+    assert_eq!(persisted.checked_at, 300);
+    assert_eq!(persisted.account, "a***@example.com");
+    assert_eq!(persisted.windows[0].remaining_percent, Some(37.0));
+
+    // 3. Even if a pre-existing empty row (t=999) already sits in SQLite from an older build,
+    //    cached_quota_for and list_quota_snapshots skip it and surface valid 37% (t=300).
+    let phantom = serde_json::to_string(&anon_empty)?;
+    reopened.connect()?.execute(
+        "INSERT OR REPLACE INTO quota_snapshots(provider, account_key, checked_at, updated_at, data)
+         VALUES('antigravity', '未提供账号', 999, 999, ?1)",
+        [phantom],
+    )?;
+    let reopened2 = Store::open(&dir.path().join("merge_guards.sqlite"))?;
+    let resilient = reopened2.cached_quota_for("antigravity", None)?.unwrap();
+    assert_eq!(resilient.checked_at, 300);
+    assert_eq!(resilient.account, "a***@example.com");
+    assert_eq!(resilient.windows[0].remaining_percent, Some(37.0));
+    let listed = reopened2.list_quota_snapshots("antigravity")?;
+    assert_eq!(listed.len(), 2, "pre-existing empty row must be skipped");
+    Ok(())
+}
+
+#[test]
+fn antigravity_v3_upgrade_enabled_imports_new_step3_written_before_step2_backfill_once() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let db_v3 = dir.path().join("enabled_v3.sqlite");
+    let brain = dir.path().join("brain");
+    let logs = brain.join("conv-order/.system_generated/logs");
+    fs::create_dir_all(&logs)?;
+    let t1 = logs.join("transcript.jsonl");
+
+    // Log order:
+    // 1) Old Step 2 initial (Nov 29: 300+20) + partial (Dec 1: 100)
+    // 2) While app was closed, NEW Step 3 (500) was appended BEFORE a late backfill of Step 2!
+    let lines = [
+        json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-29T10:00:00+08:00", "input_tokens": 300, "output_tokens": 20}),
+        json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-01T10:00:00+08:00", "cache_read_tokens": 100}),
+        json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-02T09:00:00+08:00", "input_tokens": 400, "cache_read_tokens": 50, "output_tokens": 50}),
+        json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-12-02T10:00:00+08:00", "cache_read_tokens": 100}),
+    ];
+    fs::write(&t1, lines.map(|v| v.to_string()).join("\n") + "\n")?;
+
+    // Seed enabled cursorless v3 DB containing Step 2 (420 complete from 7b1ecd9 -> legacy=1 in v3, no cursors).
+    {
+        let con = rusqlite::Connection::open(&db_v3)?;
+        con.execute_batch(
+            "PRAGMA user_version=3;
+             CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE last_quota(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+             CREATE TABLE usage(provider TEXT, session TEXT, response TEXT, at INTEGER NOT NULL, tokens INTEGER NOT NULL, at_ns INTEGER, complete INTEGER NOT NULL DEFAULT 1, input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER, legacy INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(provider,session,response));
+             CREATE INDEX usage_date ON usage(provider,at);
+             CREATE TABLE cursors(provider TEXT, path TEXT, fingerprint TEXT, pos INTEGER NOT NULL, PRIMARY KEY(provider,path));",
+        )?;
+        let settings = json!({
+            "agents": [{"id": "antigravity", "name": "Antigravity", "status": "installed", "binary": null}],
+            "enabled": ["antigravity"],
+            "confirmed": true
+        });
+        con.execute("INSERT INTO settings VALUES(1, ?1)", [settings.to_string()])?;
+        let nov29 = chrono::DateTime::parse_from_rfc3339("2026-11-29T10:00:00+08:00")?;
+        con.execute(
+            "INSERT INTO usage VALUES('antigravity','conv-order','2',?1,420,?2,1,300,100,20,1)",
+            rusqlite::params![nov29.timestamp(), nov29.timestamp_nanos_opt()],
+        )?;
+    }
+
+    let store = Store::open(&db_v3)?;
+    usage::repair_antigravity_history(&store, &brain)?;
+    let mut mon = Monitor::default();
+    mon.update(&store, "antigravity", &brain)?;
+
+    let dump = |s: &Store| -> anyhow::Result<Vec<(String, i64, i64, i64)>> {
+        let con = s.connect()?;
+        let mut stmt = con.prepare(
+            "SELECT response, tokens, complete, legacy FROM usage WHERE provider='antigravity' ORDER BY response",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+    assert_eq!(
+        dump(&store)?,
+        vec![("2".into(), 420, 1, 0), ("3".into(), 500, 1, 0)],
+        "Step 3 written before Step 2 backfill must be imported once"
+    );
+
+    // Reopen twice -> zero duplicates.
+    for _ in 0..2 {
+        let reopened = Store::open(&db_v3)?;
+        Monitor::default().update(&reopened, "antigravity", &brain)?;
+        assert_eq!(dump(&reopened)?, vec![("2".into(), 420, 1, 0), ("3".into(), 500, 1, 0)]);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_and_claude_unreadable_eof_file_does_not_block_sibling_file_new_tokens() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let today_rfc = chrono::Utc::now().to_rfc3339();
+
+    // Test both Codex and Claude Code.
+    for (prov, make_line) in [
+        (
+            "codex",
+            Box::new(|id: &str, tok: i64, ts: &str| {
+                json!({
+                    "type": "token_usage_record",
+                    "timestamp": ts,
+                    "payload": {"session_id": "s1", "response_id": id, "usage": {"total_tokens": tok}}
+                })
+                .to_string()
+            }) as Box<dyn Fn(&str, i64, &str) -> String>,
+        ),
+        (
+            "claude",
+            Box::new(|id: &str, tok: i64, ts: &str| {
+                json!({
+                    "type": "assistant",
+                    "timestamp": ts,
+                    "sessionId": "s1",
+                    "message": {"id": id, "usage": {"input_tokens": tok, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}
+                })
+                .to_string()
+            }) as Box<dyn Fn(&str, i64, &str) -> String>,
+        ),
+    ] {
+        let dir = tempdir()?;
+        let store = Store::open(&dir.path().join("sibling.sqlite"))?;
+        store.settings(false, || vec![agent(prov, "installed")])?;
+        store.select(vec![prov.into()])?;
+        let root = dir.path().join("logs");
+        fs::create_dir_all(&root)?;
+        let f1 = root.join("01_old.jsonl");
+        let f2 = root.join("02_live.jsonl");
+
+        fs::write(&f1, format!("{}\n", make_line("r1", 300, &today_rfc)))?;
+        fs::write(&f2, "")?;
+
+        let mut mon = Monitor::default();
+        let u1 = mon.update(&store, prov, &root)?;
+        assert_eq!(u1.today, Some(300));
+        assert_eq!(u1.status, SourceStatus::Active);
+
+        // Revoke permission on old EOF file 01_old.jsonl, then append 300 tokens to 02_live.jsonl.
+        let orig = fs::metadata(&f1)?.permissions();
+        fs::set_permissions(&f1, fs::Permissions::from_mode(0o000))?;
+        fs::write(&f2, format!("{}\n", make_line("r2", 300, &today_rfc)))?;
+
+        let u2 = mon.update(&store, prov, &root)?;
+        assert_eq!(u2.today, Some(600), "{prov}: sibling file must still ingest +300 -> 600");
+        assert_eq!(u2.status, SourceStatus::Partial);
+        assert_eq!(u2.unreadable_files, 1);
+
+        // Fresh Monitor must also keep 600 & Partial.
+        let u2_fresh = Monitor::default().update(&store, prov, &root)?;
+        assert_eq!(u2_fresh.today, Some(600));
+        assert_eq!(u2_fresh.status, SourceStatus::Partial);
+
+        // Restore permission -> Active, still 600 (no duplication).
+        fs::set_permissions(&f1, orig)?;
+        let u3 = mon.update(&store, prov, &root)?;
+        assert_eq!(u3.today, Some(600));
+        assert_eq!(u3.status, SourceStatus::Active);
+        assert_eq!(u3.unreadable_files, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn db_history_only_platform_survives_rescan_and_restart_with_saved_usage() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let db_path = dir.path().join("db_history_only.sqlite");
+    let store = Store::open(&db_path)?;
+    store.settings(false, || vec![agent("claude", "installed"), agent("codex", "installed")])?;
+    store.select(vec!["claude".into(), "codex".into()])?;
+
+    let now_ts = chrono::Utc::now().timestamp();
+    store.connect()?.execute(
+        "INSERT INTO usage(provider,session,response,at,tokens,at_ns,complete,legacy)
+         VALUES('claude','s1','m1',?1,777,?2,1,0)",
+        rusqlite::params![now_ts, now_ts * 1_000_000_000],
+    )?;
+
+    // Disable Claude, then rescan where both app and ~/.claude/projects are gone ("missing").
+    store.select(vec!["codex".into()])?;
+    let after_rescan = store.settings(true, || {
+        vec![agent("claude", "missing"), agent("codex", "installed")]
+    })?;
+    let claude = after_rescan.agents.iter().find(|a| a.id == "claude").unwrap();
+    assert_eq!(claude.status, "history", "DB-only platform must surface as history after rescan");
+    assert!(!after_rescan.enabled.contains(&"claude".to_string()));
+    assert!(store.select(vec!["codex".into(), "claude".into()]).is_err(), "DB-only platform without app/dir cannot be enabled");
+
+    // Restart (reopen Store + settings(false)): still status="history" and saved_totals reads 777 read-only.
+    let reopened = Store::open(&db_path)?;
+    let after_restart = reopened.settings(false, Vec::new)?;
+    assert_eq!(
+        after_restart.agents.iter().find(|a| a.id == "claude").unwrap().status,
+        "history"
+    );
+    let saved = usage::saved_totals(&reopened, "claude")?;
+    assert_eq!(saved.today, Some(777));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_statusline_bridge_cleans_temp_files_and_preserves_upstream_output_and_exit_code()
+-> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    let src_bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/antigravity-statusline-bridge.sh");
+    assert!(src_bridge.is_file(), "bridge script must exist at {src_bridge:?}");
+
+    let dir = tempdir()?;
+    // Put both the copied bridge script and data dir under paths containing spaces.
+    let app_dir = dir.path().join("Agent Use.app/Contents/Resources");
+    let data_dir = dir.path().join("Application Support/dev.agentuse.desktop");
+    let tmp_dir = dir.path().join("isolated tmp");
+    fs::create_dir_all(&app_dir)?;
+    fs::create_dir_all(&tmp_dir)?;
+    let bridge = app_dir.join("antigravity-statusline-bridge.sh");
+    fs::copy(&src_bridge, &bridge)?;
+    fs::set_permissions(&bridge, fs::Permissions::from_mode(0o755))?;
+
+    // Upstream script echoes stdin byte length & custom bar line, and exits with MOCK_EXIT_CODE.
+    let upstream = dir.path().join("my statusline.sh");
+    fs::write(
+        &upstream,
+        "#!/usr/bin/env sh\npayload=\"$(cat)\"\nprintf 'CUSTOM_BAR|%s\\n' \"$payload\"\nexit \"${MOCK_EXIT_CODE:-0}\"\n",
+    )?;
+    fs::set_permissions(&upstream, fs::Permissions::from_mode(0o755))?;
+
+    let run_bridge = |payload: &str,
+                      target_env: (&str, &std::path::Path),
+                      exit_code: &str|
+     -> anyhow::Result<(i32, String)> {
+        let mut child = Command::new(&bridge)
+            .arg(&upstream)
+            .env("TMPDIR", &tmp_dir)
+            .env(target_env.0, target_env.1)
+            .env("MOCK_EXIT_CODE", exit_code)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.as_mut().unwrap().write_all(payload.as_bytes())?;
+        let out = child.wait_with_output()?;
+        Ok((
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        ))
+    };
+
+    // Case 1: 3 consecutive runs -> 0 leftover temp files, snapshot updated, stdout intact.
+    for i in 1..=3 {
+        let payload = format!(
+            r#"{{"product":"antigravity","email":"alice@example.com","captured_at":{},"quota":{{"gemini-5h":{{"remaining_fraction":0.8{}}}}}}}"#,
+            1796000000 + i,
+            i
+        );
+        let (code, stdout) = run_bridge(&payload, ("AGENT_USE_DATA_DIR", &data_dir), "0")?;
+        assert_eq!(code, 0);
+        assert_eq!(stdout, format!("CUSTOM_BAR|{payload}\n"));
+    }
+    let tmp_leftovers: Vec<_> = fs::read_dir(&tmp_dir)?.collect::<Result<_, _>>()?;
+    assert!(
+        tmp_leftovers.is_empty(),
+        "TMPDIR must have 0 leftover files after 3 runs, found: {tmp_leftovers:?}"
+    );
+    let snap_path = data_dir.join("antigravity_statusline.json");
+    let snap = quota::read_antigravity_statusline(&snap_path)?;
+    assert_eq!(snap.checked_at, 1796000003);
+    assert_eq!(snap.windows[0].remaining_percent, Some(83.0));
+    let hidden_leftovers: Vec<_> = fs::read_dir(&data_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+        .collect();
+    assert!(hidden_leftovers.is_empty(), "data_dir must have no leftover temp files");
+
+    // Case 2: Unwritable target directory -> upstream still receives full stdin, outputs stdout, exits 0, 0 temp files.
+    let ro_dir = dir.path().join("readonly_target");
+    fs::create_dir_all(&ro_dir)?;
+    fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o555))?;
+    let payload_ro = r#"{"product":"antigravity","quota":{"gemini-5h":{"remaining_fraction":0.5}}}"#;
+    let res_ro = run_bridge(
+        payload_ro,
+        ("AGENT_USE_ANTIGRAVITY_STATUSLINE_PATH", &ro_dir.join("snap.json")),
+        "0",
+    );
+    fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o755))?;
+    let (code_ro, stdout_ro) = res_ro?;
+    assert_eq!(code_ro, 0, "unwritable target must not break upstream exit code");
+    assert_eq!(stdout_ro, format!("CUSTOM_BAR|{payload_ro}\n"));
+    assert!(
+        fs::read_dir(&tmp_dir)?.next().is_none(),
+        "TMPDIR must have 0 leftover files on unwritable target"
+    );
+
+    // Case 3: Upstream exits non-zero (7) -> preserve stdout, write snapshot, clean temp files, return 7.
+    let payload_nz = r#"{"product":"antigravity","captured_at":1796000099,"quota":{"gemini-5h":{"remaining_fraction":0.42}}}"#;
+    let (code_nz, stdout_nz) = run_bridge(payload_nz, ("AGENT_USE_DATA_DIR", &data_dir), "7")?;
+    assert_eq!(code_nz, 7, "must propagate exact upstream non-zero exit code");
+    assert_eq!(stdout_nz, format!("CUSTOM_BAR|{payload_nz}\n"));
+    assert!(
+        fs::read_dir(&tmp_dir)?.next().is_none(),
+        "TMPDIR must have 0 leftover files on non-zero upstream exit"
+    );
+    let snap_nz = quota::read_antigravity_statusline(&snap_path)?;
+    assert_eq!(snap_nz.checked_at, 1796000099);
+    assert_eq!(snap_nz.windows[0].remaining_percent, Some(42.0));
     Ok(())
 }

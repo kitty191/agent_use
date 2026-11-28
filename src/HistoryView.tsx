@@ -150,6 +150,22 @@ function formatRangeSummary(page: HistoryPage) {
   return `${prefix}${page.range_start} 至 ${page.range_end}`;
 }
 
+function formatChartTitle(page: HistoryPage) {
+  if (page.granularity === "week") {
+    return page.is_current
+      ? "本周逐日趋势"
+      : `${page.range_start} 至 ${page.range_end} 逐日趋势`;
+  }
+  if (page.granularity === "month") {
+    if (page.is_current) return "本月逐日趋势";
+    const [year, month] = page.range_start.split("-");
+    return `${year}年${Number(month)}月逐日趋势`;
+  }
+  return page.is_current
+    ? "今年逐月趋势"
+    : `${page.range_start.slice(0, 4)}年逐月趋势`;
+}
+
 function pagerLabels(granularity: Granularity) {
   switch (granularity) {
     case "day":
@@ -576,14 +592,27 @@ function HistoryTable({
   );
 }
 
-export function HistoryView({ active }: { active: boolean }) {
+export function HistoryView({
+  active,
+  initialProvider,
+}: {
+  active: boolean;
+  initialProvider?: string | null;
+}) {
   const [granularity, setGranularity] = useState<Granularity>("day");
   const [offset, setOffset] = useState(0);
-  const [provider, setProvider] = useState<string>("all");
+  const [provider, setProvider] = useState<string>(initialProvider || "all");
   const [pageState, setPageState] = useState<{ key: string; data: HistoryPage } | null>(null);
   const [availableProviders, setAvailableProviders] = useState<ProviderOption[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (initialProvider) {
+      setProvider(initialProvider);
+      setOffset(0);
+    }
+  }, [initialProvider]);
 
   const mountedRef = useRef(true);
   const reqIdRef = useRef(0);
@@ -838,13 +867,17 @@ export function HistoryView({ active }: { active: boolean }) {
                 ))}
               </div>
             ) : (
-              <span className="kpi-sub">当前周期无已记录用量</span>
+              <span className="kpi-sub">本周期无记录</span>
             )}
           </div>
 
           <div className="panel kpi-card">
             <small>不完整与旧版补充口径</small>
-            {summary.incomplete_steps === 0 && summary.legacy_steps === 0 ? (
+            {summary.verified_steps === 0 &&
+            summary.incomplete_steps === 0 &&
+            summary.legacy_steps === 0 ? (
+              <span className="kpi-sub">本周期无记录</span>
+            ) : summary.incomplete_steps === 0 && summary.legacy_steps === 0 ? (
               <span className="kpi-sub kpi-ok">
                 当前周期全部记录均已核验完整
               </span>
@@ -872,13 +905,7 @@ export function HistoryView({ active }: { active: boolean }) {
         <section className="panel history-chart-panel">
           <div className="section-head">
             <div>
-              <h2>
-                {granularity === "week"
-                  ? "本周逐日趋势"
-                  : granularity === "month"
-                    ? "本月逐日趋势"
-                    : "本年逐月趋势"}
-              </h2>
+              <h2>{formatChartTitle(page)}</h2>
               <small>
                 图表、明细与上方合计来自同一次 SQLite 读取快照；
                 {detailGranularity === "month"

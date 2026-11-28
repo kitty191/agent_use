@@ -33,7 +33,19 @@ AGENT_USE_DATA_DIR="$TMP_DIR" "target/release/bundle/macos/Agent Use.app/Content
 
 - **Codex**：启动、手动刷新及每五分钟通过本机 app-server 查询当前账号和额度（不发起模型请求），按返回窗口时长显示剩余百分比与重置倒计时。查询失败时区分 CLI 定位、登录状态与网络/限流环节，并保留上次成功快照及其原账号标签和查询时间。
 - **Codex / Claude Code**：首次读取已启用来源的 JSONL，之后通过文件系统事件增量更新。面板也会检查最近使用的日志是否增长，每 30 秒校验已启用平台的日志目录，以补读遗漏的文件。面板显示本机今日 Token 与最近一次响应。缺少记录的字段显示为「—」。
-- **Antigravity**：从本机对话日志 `~/.gemini/antigravity/brain/<conversation-id>/.system_generated/logs/transcript.jsonl` 增量统计今日已记录 Token 与最近一次模型步骤（不读取 `transcript_full.jsonl` 与 `chunks/`，无需登录 Google 账号或安装 `agy` CLI）。账号归属、模型池、剩余额度与重置时间仍暂不可查（详见 [docs/phase0_verification_report.md](docs/phase0_verification_report.md)）。
+- **Antigravity**：从本机对话日志 `~/.gemini/antigravity/brain/<conversation-id>/.system_generated/logs/transcript.jsonl` 增量统计今日已记录 Token 与最近一次模型步骤（不读取 `transcript_full.jsonl` 与 `chunks/`，桌面端无需安装 `agy` CLI）。仅安装桌面版时，官方模型限额请在 Antigravity **设置 → Models** 查看；如同时使用官方 Antigravity CLI（`agy`），正式应用包已内置桥接脚本 `Agent Use.app/Contents/Resources/antigravity-statusline-bridge.sh`（源码位于 [scripts/antigravity-statusline-bridge.sh](scripts/antigravity-statusline-bridge.sh)），可在应用内 Antigravity 卡片一键复制配置，或在 `~/.gemini/antigravity-cli/settings.json` 中手动配置（路径含空格需保留单引号）：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "'/Applications/Agent Use.app/Contents/Resources/antigravity-statusline-bridge.sh'",
+    "stack_with_default": true
+  }
+}
+```
+
+若已有自定义状态栏脚本，只需将其路径作为参数传给桥接脚本（如 `"'/Applications/Agent Use.app/Contents/Resources/antigravity-statusline-bridge.sh' ~/.gemini/antigravity-cli/statusline.sh"`），即可完整保留原有状态栏输出、退出码与零临时文件残留，并将官方 JSON 原子写入 `~/Library/Application Support/dev.agentuse.desktop/antigravity_statusline.json`。
 - **历史用量统计**：顶部切换到「历史用量」直接查询 SQLite，每页聚焦单个自然周期并随粒度翻页：按日查看单天、按周看该自然周（周一起算）与逐日明细、按月看该自然月与逐日明细、按年看该自然年与逐月明细；支持按平台筛选、单独标注该平台最早记录，本周/本月/今年均统计至本地今天，过去周期按完整自然周期汇总；同时支持已停用平台历史回看与实时只读刷新，区分「无已记录用量」「明确为 0」「用量不完整」「旧版记录值」。
 - **DeepSeek 桌面端等**：当前展示本机发现状态，账号、Token 和额度采集取决于各自数据源后续验证。
 

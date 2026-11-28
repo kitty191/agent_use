@@ -84,8 +84,9 @@ pub struct Monitor {
     recent: BTreeSet<(SystemTime, PathBuf)>,
     last_reconcile: Option<Instant>,
     codex_day_dirs: BTreeMap<PathBuf, SystemTime>,
-    antigravity_transcripts: BTreeMap<PathBuf, (SystemTime, u64)>,
-    failed_antigravity: BTreeMap<PathBuf, FailedFile>,
+    antigravity_transcripts: BTreeMap<PathBuf, (SystemTime, u64, Option<(u32, i64, u64)>)>,
+    known_jsonl_files: BTreeMap<PathBuf, (SystemTime, u64, Option<(u32, i64, u64)>)>,
+    failed_files: BTreeMap<PathBuf, FailedFile>,
     repair_next_retry: Option<Instant>,
     changes: Arc<Mutex<Changes>>,
 }
@@ -196,8 +197,8 @@ impl Monitor {
         }
         let mut pending = std::mem::take(&mut *self.changes.lock().unwrap());
         let now_inst = Instant::now();
-        let mut discovered_transcripts = Vec::new();
-        let mut unreadable_entries = Vec::new();
+        let discovered_transcripts;
+        let unreadable_entries;
         let mut perm_recovered = false;
 
         if id == "codex" {
@@ -219,8 +220,9 @@ impl Monitor {
                 }
             }
             self.codex_day_dirs = day_dirs;
-        } else if id == "antigravity" {
-            let (found, unavail) = discover_antigravity_transcripts(root)?;
+        }
+        if id != "antigravity" {
+            let (found, unavail) = discover_jsonl_files(root);
             discovered_transcripts = found;
             unreadable_entries = unavail;
 
@@ -229,11 +231,11 @@ impl Monitor {
                 .cloned()
                 .chain(unreadable_entries.iter().map(|(p, _)| p.clone()))
                 .collect();
-            self.failed_antigravity.retain(|p, _| present_set.contains(p));
+            self.failed_files.retain(|p, _| present_set.contains(p));
 
             for (path, reason) in &unreadable_entries {
                 self.recent.retain(|(_, p)| p != path);
-                let prev = self.failed_antigravity.get(path);
+                let prev = self.failed_files.get(path);
                 let next_retry = prev
                     .map(|f| {
                         if now_inst >= f.next_retry {
@@ -243,7 +245,72 @@ impl Monitor {
                         }
                     })
                     .unwrap_or_else(|| now_inst + FAILED_RETRY_INTERVAL);
-                self.failed_antigravity.insert(
+                self.failed_files.insert(
+                    path.clone(),
+                    FailedFile {
+                        sig: None,
+                        next_retry,
+                        reason: reason.clone(),
+                    },
+                );
+            }
+
+            let mut current = BTreeMap::new();
+            for file_path in &discovered_transcripts {
+                match std::fs::metadata(file_path) {
+                    Ok(meta) => {
+                        let perm_sig = file_perm_sig(&meta);
+                        let sig = (meta.modified()?, meta.len(), perm_sig);
+                        if let Some(failed) = self.failed_files.get(file_path) {
+                            let sig_changed = failed.sig != perm_sig;
+                            if sig_changed || now_inst >= failed.next_retry {
+                                pending.paths.insert(file_path.clone());
+                            }
+                        } else if self.known_jsonl_files.get(file_path) != Some(&sig) {
+                            pending.paths.insert(file_path.clone());
+                        }
+                        current.insert(file_path.clone(), sig);
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        self.recent.retain(|(_, p)| p != file_path);
+                        self.failed_files.insert(
+                            file_path.clone(),
+                            FailedFile {
+                                sig: None,
+                                next_retry: now_inst + FAILED_RETRY_INTERVAL,
+                                reason: format!("无法访问日志文件 {}: {e}", file_path.display()),
+                            },
+                        );
+                    }
+                }
+            }
+            self.known_jsonl_files = current;
+        } else {
+            let (found, unavail) = discover_antigravity_transcripts(root)?;
+            discovered_transcripts = found;
+            unreadable_entries = unavail;
+
+            let present_set: BTreeSet<PathBuf> = discovered_transcripts
+                .iter()
+                .cloned()
+                .chain(unreadable_entries.iter().map(|(p, _)| p.clone()))
+                .collect();
+            self.failed_files.retain(|p, _| present_set.contains(p));
+
+            for (path, reason) in &unreadable_entries {
+                self.recent.retain(|(_, p)| p != path);
+                let prev = self.failed_files.get(path);
+                let next_retry = prev
+                    .map(|f| {
+                        if now_inst >= f.next_retry {
+                            now_inst + FAILED_RETRY_INTERVAL
+                        } else {
+                            f.next_retry
+                        }
+                    })
+                    .unwrap_or_else(|| now_inst + FAILED_RETRY_INTERVAL);
+                self.failed_files.insert(
                     path.clone(),
                     FailedFile {
                         sig: None,
@@ -257,9 +324,9 @@ impl Monitor {
             for transcript in &discovered_transcripts {
                 match std::fs::metadata(transcript) {
                     Ok(meta) => {
-                        let sig = (meta.modified()?, meta.len());
                         let perm_sig = file_perm_sig(&meta);
-                        if let Some(failed) = self.failed_antigravity.get(transcript) {
+                        let sig = (meta.modified()?, meta.len(), perm_sig);
+                        if let Some(failed) = self.failed_files.get(transcript) {
                             let sig_changed = failed.sig != perm_sig;
                             if sig_changed {
                                 perm_recovered = true;
@@ -275,7 +342,7 @@ impl Monitor {
                     Err(e) if e.kind() == ErrorKind::NotFound => continue,
                     Err(e) => {
                         self.recent.retain(|(_, p)| p != transcript);
-                        self.failed_antigravity.insert(
+                        self.failed_files.insert(
                             transcript.clone(),
                             FailedFile {
                                 sig: None,
@@ -305,31 +372,31 @@ impl Monitor {
 
         self.sync(store, id, root, pending, reconcile, now_inst)?;
 
-        if id == "antigravity" {
-            let total_seen = discovered_transcripts.len() + unreadable_entries.len();
-            if total_seen == 0 {
-                return totals(store, id, SourceStatus::Waiting, 0, None);
-            }
-            let unreadable = self.failed_antigravity.len();
-            let readable = total_seen.saturating_sub(unreadable);
-            if readable == 0 && unreadable > 0 {
-                let first_reason = self
-                    .failed_antigravity
-                    .values()
-                    .next()
-                    .map(|f| f.reason.as_str())
-                    .unwrap_or("无读取权限");
-                bail!(
-                    "无法读取任何 Antigravity 日志文件（共 {unreadable} 份不可读）：{first_reason}"
-                );
-            }
-            if unreadable > 0 {
-                let msg = format!(
-                    "有 {unreadable} 份会话日志不可读，当前统计可能遗漏部分用量"
-                );
-                return totals(store, id, SourceStatus::Partial, unreadable, Some(msg));
-            }
-            return totals(store, id, SourceStatus::Active, 0, None);
+        let present_after: BTreeSet<PathBuf> = discovered_transcripts
+            .iter()
+            .cloned()
+            .chain(unreadable_entries.iter().map(|(p, _)| p.clone()))
+            .collect();
+        self.failed_files.retain(|p, _| present_after.contains(p));
+
+        let total_seen = discovered_transcripts.len() + unreadable_entries.len();
+        if id == "antigravity" && total_seen == 0 {
+            return totals(store, id, SourceStatus::Waiting, 0, None);
+        }
+        let unreadable = self.failed_files.len();
+        let readable = total_seen.saturating_sub(unreadable);
+        if total_seen > 0 && readable == 0 && unreadable > 0 {
+            let first_reason = self
+                .failed_files
+                .values()
+                .next()
+                .map(|f| f.reason.as_str())
+                .unwrap_or("无读取权限");
+            bail!("无法读取任何 {id} 日志文件（共 {unreadable} 份不可读）：{first_reason}");
+        }
+        if unreadable > 0 {
+            let msg = format!("有 {unreadable} 份会话日志不可读，当前统计可能遗漏部分用量");
+            return totals(store, id, SourceStatus::Partial, unreadable, Some(msg));
         }
 
         totals(store, id, SourceStatus::Active, 0, None)
@@ -340,7 +407,8 @@ impl Monitor {
         self.recent.clear();
         self.codex_day_dirs.clear();
         self.antigravity_transcripts.clear();
-        self.failed_antigravity.clear();
+        self.known_jsonl_files.clear();
+        self.failed_files.clear();
         self.repair_next_retry = None;
         self.last_reconcile = None;
     }
@@ -374,7 +442,7 @@ impl Monitor {
                 root,
                 &path,
                 &mut self.recent,
-                &mut self.failed_antigravity,
+                &mut self.failed_files,
                 now_inst,
             ) {
                 Ok(()) => {}
@@ -393,6 +461,10 @@ impl Monitor {
         }
         Ok(())
     }
+}
+
+pub fn saved_totals(store: &Store, id: &str) -> Result<Usage> {
+    totals(store, id, SourceStatus::Waiting, 0, None)
 }
 
 fn totals(
@@ -572,6 +644,32 @@ fn totals(
         unreadable_files,
         warning,
     })
+}
+
+fn discover_jsonl_files(root: &Path) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+    let mut found = Vec::new();
+    let mut unreadable = Vec::new();
+    for entry in WalkDir::new(root) {
+        match entry {
+            Ok(entry) => {
+                if entry.file_type().is_file()
+                    && entry.path().extension().and_then(|s| s.to_str()) == Some("jsonl")
+                {
+                    found.push(entry.into_path());
+                }
+            }
+            Err(e) => {
+                let p = e
+                    .path()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| root.to_path_buf());
+                unreadable.push((p, format!("无法访问日志路径: {e}")));
+            }
+        }
+    }
+    found.sort();
+    unreadable.sort();
+    (found, unreadable)
 }
 
 fn discover_antigravity_transcripts(root: &Path) -> Result<(Vec<PathBuf>, Vec<(PathBuf, String)>)> {
@@ -993,19 +1091,18 @@ fn repair_cursor_task(
             }
         }
     }
-    let all_verified = verified_steps.len() == legacy_rows.len();
 
     let tx = db.transaction()?;
     for (resp, recon) in verified_steps {
         write_verified_recon_step(&tx, &conv_id, resp, recon)?;
     }
-    if all_verified {
-        let pos_i64 = i64::try_from(read_pos).map_err(|e| OpError::Io(e.into()))?;
-        tx.execute(
-            "INSERT OR REPLACE INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
-            params![target, expected_fp, pos_i64],
-        )?;
-    }
+    // Hand off the repaired prefix boundary so subsequent incremental polls never
+    // re-read [0..read_pos) or promote unverified legacy=1 steps on re-enable.
+    let pos_i64 = i64::try_from(read_pos).map_err(|e| OpError::Io(e.into()))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+        params![target, expected_fp, pos_i64],
+    )?;
     tx.execute(
         "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
         [target],
@@ -1084,9 +1181,12 @@ fn repair_session_task(
         .collect();
     let mut bytes = Vec::new();
     let mut byte_pos = 0u64;
+    let mut max_legacy_step_pos = 0u64;
+    let mut first_untracked_step_pos: Option<u64> = None;
 
     loop {
         bytes.clear();
+        let line_start = byte_pos;
         let len = reader
             .read_until(b'\n', &mut bytes)
             .map_err(|e| OpError::Io(e.into()))?;
@@ -1097,6 +1197,11 @@ fn repair_session_task(
         if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(rec) = record("antigravity", Some(session), &event) {
                 let resp = rec.response.clone();
+                if legacy_rows.contains_key(&resp) {
+                    max_legacy_step_pos = max_legacy_step_pos.max(byte_pos);
+                } else {
+                    first_untracked_step_pos.get_or_insert(line_start);
+                }
                 let recon = recon_map
                     .entry(resp.clone())
                     .and_modify(|s| s.merge(&rec))
@@ -1121,18 +1226,28 @@ fn repair_session_task(
         }
     }
     let all_verified = verified_steps.len() == legacy_rows.len();
+    // Anchor the file cursor without jumping past any brand-new step (e.g. Step 3)
+    // written before a late backfill of an older step (e.g. Step 2).
+    let cursor_pos = if max_verified_pos == 0 && max_legacy_step_pos == 0 {
+        byte_pos
+    } else {
+        let raw = if all_verified {
+            max_verified_pos
+        } else {
+            max_verified_pos.max(max_legacy_step_pos)
+        };
+        first_untracked_step_pos.map_or(raw, |first| raw.min(first))
+    };
 
     let tx = db.transaction()?;
     for (resp, recon) in verified_steps {
         write_verified_recon_step(&tx, session, resp, recon)?;
     }
-    if all_verified {
-        let pos_i64 = i64::try_from(max_verified_pos).map_err(|e| OpError::Io(e.into()))?;
-        tx.execute(
-            "INSERT OR REPLACE INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
-            params![path.to_string_lossy(), fp, pos_i64],
-        )?;
-    }
+    let pos_i64 = i64::try_from(cursor_pos).map_err(|e| OpError::Io(e.into()))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO cursors VALUES('antigravity', ?1, ?2, ?3)",
+        params![path.to_string_lossy(), fp, pos_i64],
+    )?;
     tx.execute(
         "UPDATE antigravity_repair_tasks SET done=1 WHERE target=?1",
         [session],
@@ -1168,6 +1283,18 @@ fn antigravity_file_pending_repair(
     Ok(false)
 }
 
+fn normalize_under_root(base_root: &Path, path: &Path) -> PathBuf {
+    if path.starts_with(base_root) {
+        return path.to_path_buf();
+    }
+    if let (Ok(canon_root), Ok(canon_path)) = (base_root.canonicalize(), path.canonicalize()) {
+        if let Ok(rel) = canon_path.strip_prefix(&canon_root) {
+            return base_root.join(rel);
+        }
+    }
+    path.to_path_buf()
+}
+
 fn import(
     db: &mut rusqlite::Connection,
     id: &str,
@@ -1177,6 +1304,8 @@ fn import(
     failed_antigravity: &mut BTreeMap<PathBuf, FailedFile>,
     now_inst: Instant,
 ) -> std::result::Result<(), OpError> {
+    let normalized_target = normalize_under_root(base_root, target);
+    let target = normalized_target.as_path();
     if !target.exists() {
         return Ok(());
     }
@@ -1280,13 +1409,59 @@ fn import(
     }
 
     for entry in WalkDir::new(target) {
-        let entry = entry.map_err(|e| OpError::Io(e.into()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                let p = e
+                    .path()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| target.to_path_buf());
+                recent.retain(|(_, rp)| rp != &p);
+                failed_antigravity.insert(
+                    p,
+                    FailedFile {
+                        sig: None,
+                        next_retry: now_inst + FAILED_RETRY_INTERVAL,
+                        reason: format!("无法访问日志路径: {e}"),
+                    },
+                );
+                continue;
+            }
+        };
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl")
         {
             continue;
         }
-        import_file(db, id, entry.path(), None, recent)?;
+        let file_path = entry.into_path();
+        if let Some(failed) = failed_antigravity.get(&file_path) {
+            let current_sig = std::fs::metadata(&file_path)
+                .ok()
+                .and_then(|m| file_perm_sig(&m));
+            if current_sig == failed.sig && now_inst < failed.next_retry {
+                continue;
+            }
+        }
+        match import_file(db, id, &file_path, None, recent) {
+            Ok(()) => {
+                failed_antigravity.remove(&file_path);
+            }
+            Err(OpError::Db(err)) => return Err(OpError::Db(err)),
+            Err(OpError::Io(err)) => {
+                recent.retain(|(_, p)| p != &file_path);
+                let sig = std::fs::metadata(&file_path)
+                    .ok()
+                    .and_then(|m| file_perm_sig(&m));
+                failed_antigravity.insert(
+                    file_path,
+                    FailedFile {
+                        sig,
+                        next_retry: now_inst + FAILED_RETRY_INTERVAL,
+                        reason: err.to_string(),
+                    },
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1346,8 +1521,12 @@ fn upsert_antigravity_record(tx: &rusqlite::Transaction<'_>, rec: &ParsedRecord)
         .optional()?;
 
     let (at, at_ns, input, in_ts, cache_read, cr_ts, output, out_ts) = match existing {
-        None | Some((_, _, _, _, _, 1, _, _, _)) => {
-            // New row or legacy pre-v3 row being repaired from on-disk transcript: initialize cleanly.
+        Some((_, _, _, _, _, 1, _, _, _)) => {
+            // Preserve rows intentionally left as unverified legacy=1 by history repair.
+            return Ok(());
+        }
+        None => {
+            // New verified row initialized from on-disk transcript.
             (
                 rec.at,
                 rec.at_ns,
@@ -1435,18 +1614,6 @@ fn import_file(
             ));
         }
     };
-    let modified = meta.modified().map_err(|e| OpError::Io(e.into()))?;
-    if recent.len() < HOT_LOG_LIMIT
-        || recent
-            .first()
-            .is_some_and(|(oldest, _)| modified >= *oldest)
-    {
-        recent.retain(|(_, p)| p != path);
-        recent.insert((modified, path.to_path_buf()));
-        if recent.len() > HOT_LOG_LIMIT {
-            recent.pop_first();
-        }
-    }
     let fingerprint = file_id(&meta);
     let key = path.to_string_lossy();
     let cursor: Option<(String, i64)> = db
@@ -1459,9 +1626,8 @@ fn import_file(
     let mut pos = cursor
         .filter(|(f, p)| f == &fingerprint && *p >= 0 && *p as u64 <= meta.len())
         .map_or(0, |(_, p)| p as u64);
-    if pos == meta.len() {
-        return Ok(());
-    }
+    // Open the file before checking EOF so permission revocation is detected immediately
+    // even when cursor already reached the end of file, while still reading 0 bytes at EOF.
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
@@ -1473,6 +1639,21 @@ fn import_file(
     };
     let opened_meta = file.metadata().map_err(|e| OpError::Io(e.into()))?;
     if file_id(&opened_meta) != fingerprint {
+        return Ok(());
+    }
+    let modified = opened_meta.modified().map_err(|e| OpError::Io(e.into()))?;
+    if recent.len() < HOT_LOG_LIMIT
+        || recent
+            .first()
+            .is_some_and(|(oldest, _)| modified >= *oldest)
+    {
+        recent.retain(|(_, p)| p != path);
+        recent.insert((modified, path.to_path_buf()));
+        if recent.len() > HOT_LOG_LIMIT {
+            recent.pop_first();
+        }
+    }
+    if pos == opened_meta.len() {
         return Ok(());
     }
     let mut reader = BufReader::new(file);
@@ -1744,7 +1925,7 @@ mod tests {
         assert_eq!(u1.unreadable_files, 1);
         let first_reconcile = mon.last_reconcile.expect("reconcile stamp should stay set");
         assert!(!mon.changes.lock().unwrap().all, "must not force full rescan on every poll");
-        assert!(mon.failed_antigravity.contains_key(&ta));
+        assert!(mon.failed_files.contains_key(&ta));
 
         // Second poll within retry window reuses cached failed entry without full rescan or opening ta.
         let u2 = mon.update(&store, "antigravity", &brain)?;
@@ -1757,7 +1938,7 @@ mod tests {
         let u3 = mon.update(&store, "antigravity", &brain)?;
         assert_eq!(u3.status, SourceStatus::Active);
         assert_eq!(u3.today, Some(322));
-        assert!(mon.failed_antigravity.is_empty());
+        assert!(mon.failed_files.is_empty());
         Ok(())
     }
 }
